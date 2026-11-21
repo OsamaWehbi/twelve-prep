@@ -760,7 +760,114 @@ function rawToLevel(section, correct, total){
 
 /* ---------- audio ---------- */
 const VOICES = ['buttery','airy','rounded','glassy'];
+/* Gemini voices, grouped by how they sound */
+const G_FEMALE = ['Kore','Aoede','Leda','Sulafat','Despina','Zephyr','Achernar','Vindemiatrix'];
+const G_MALE = ['Charon','Puck','Orus','Iapetus','Achird','Algieba','Schedar','Sadaltager'];
+const G_NARRATOR = 'Kore';
+const G_TTS_MODELS = ['gemini-3.8-flash-tts','gemini-3.8-flash-lite-tts'];
+const G_CACHE = new Map();
+let G_PLAY = null, G_SHAPE = 0;   /* which request shape the API accepted */
+function useGeminiVoices(){ return !IN_ARTIFACT && !S.gTTSOff && S.ai.geminiTTS !== false && !!(S.ai.geminiKey || '').trim(); }
+function genderOf(l){ const g = String(l.gender || '').toLowerCase(); return g.startsWith('f') ? 'female' : g.startsWith('m') ? 'male' : ''; }
+/* give each speaker a voice that matches their gender, all different within one script */
+function castVoices(lines, femalePool, malePool){
+  const map = {}, used = {female:0, male:0}; let alt = 0;
+  for (const l of lines) {
+    if (l.speaker in map) continue;
+    if (l.speaker === 'Narrator') { map[l.speaker] = femalePool === G_FEMALE ? G_NARRATOR : (femalePool[0] || null); continue; }
+    let g = genderOf(l); if (!g) g = (alt++ % 2) ? 'male' : 'female';
+    const pool = g === 'female' ? femalePool : malePool;
+    map[l.speaker] = pool.length ? pool[used[g]++ % pool.length] : null;
+  }
+  return map;
+}
+function b64bytes(b64){ const bin = atob(b64), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
+function pcmToWav(pcm, rate){
+  const h = new ArrayBuffer(44), d = new DataView(h), w = (o, t) => { for (let i = 0; i < 4; i++) d.setUint8(o + i, t.charCodeAt(i)); };
+  w(0,'RIFF'); d.setUint32(4, 36 + pcm.length, true); w(8,'WAVE'); w(12,'fmt '); d.setUint32(16,16,true); d.setUint16(20,1,true); d.setUint16(22,1,true);
+  d.setUint32(24, rate, true); d.setUint32(28, rate * 2, true); d.setUint16(32,2,true); d.setUint16(34,16,true); w(36,'data'); d.setUint32(40, pcm.length, true);
+  return new Blob([h, pcm], {type:'audio/wav'});
+}
+async function geminiSpeak(text, voice){
+  const key = voice + '|' + text;
+  if (G_CACHE.has(key)) return G_CACHE.get(key);
+  const job = (async () => {
+    const style = 'natural, conversational everyday English at a normal, clear pace';
+    const bodies = [
+      {contents:[{role:'user', parts:[{text, speech_metadata:{style}}]}], generationConfig:{responseModalities:['AUDIO'], speechConfig:{voiceConfig:{voice}}}},
+      {contents:[{role:'user', parts:[{text}]}], generationConfig:{responseModalities:['AUDIO'], speechConfig:{voiceConfig:{prebuiltVoiceConfig:{voiceName:voice}}}}}
+    ];
+    let last = null;
+    for (const model of G_TTS_MODELS) {
+      for (let b = G_SHAPE; b < bodies.length; b++) {
+        const body = bodies[b];
+        let res;
+        try {
+          res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+            method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':S.ai.geminiKey.trim()}, body:JSON.stringify(body)});
+        } catch(e) { last = {code:'network'}; break; }
+        if (res.status === 400) { last = {code:'bad_request', status:400}; continue; }   /* try the other request shape */
+        if (res.status === 401 || res.status === 403) throw {code:'key', status:res.status};
+        if (!res.ok) { last = {code:'http', status:res.status}; break; }                 /* 404 / 429 / 5xx: next model */
+        const j = await res.json();
+        const part = ((((j.candidates || [])[0] || {}).content || {}).parts || []).find(x => x.inlineData || x.inline_data);
+        const inl = part && (part.inlineData || part.inline_data);
+        if (!inl || !inl.data) { last = {code:'empty'}; break; }
+        G_SHAPE = b;
+        const bytes = b64bytes(inl.data), mime = String(inl.mimeType || inl.mime_type || '');
+        const isWav = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46;
+        const rate = parseInt((mime.match(/rate=(\d+)/) || [])[1] || '24000', 10);
+        return URL.createObjectURL(isWav ? new Blob([bytes], {type:'audio/wav'}) : pcmToWav(bytes, rate));
+      }
+    }
+    throw last || {code:'unavailable'};
+  })();
+  G_CACHE.set(key, job);
+  job.catch(() => G_CACHE.delete(key));
+  return job;
+}
+/* start making audio early so playback doesn't wait (2 requests at a time) */
+function prefetchVoices(lines){
+  if (!useGeminiVoices() || !lines || !lines.length) return;
+  const map = castVoices(lines, G_FEMALE, G_MALE);
+  const jobs = lines.map(l => () => geminiSpeak(l.text.slice(0, 3000), map[l.speaker]).catch(() => {}));
+  let k = 0; const run = () => { if (k < jobs.length) jobs[k++]().then(run); };
+  run(); run();
+}
+function playGemini(lines, onLine){
+  const me = G_PLAY = {stopped:false, audio:null, stopAt:null};
+  const map = castVoices(lines, G_FEMALE, G_MALE);
+  const get = i => geminiSpeak(lines[i].text.slice(0, 3000), map[lines[i].speaker]);
+  get(0); if (lines.length > 1) get(1);
+  return (async () => {
+    for (let i = 0; i < lines.length; i++) {
+      if (me.stopped) return 'stopped';
+      const url = await get(i);
+      if (i + 2 < lines.length) get(i + 2).catch(() => {});   /* keep two lines ahead */
+      if (me.stopped) return 'stopped';
+      onLine && onLine(i);
+      await new Promise((res, rej) => {
+        const a = me.audio = new Audio(url);
+        a.onended = res; a.onerror = () => rej({code:'play'}); me.stopAt = res;
+        a.play().catch(rej);
+      });
+      if (me.stopped) return 'stopped';
+      if (i < lines.length - 1 && lines[i + 1].speaker !== lines[i].speaker) await new Promise(r => setTimeout(r, 250));
+    }
+  })();
+}
 function playScript(lines, onLine){
+  if (useGeminiVoices()) {
+    return playGemini(lines, onLine).catch(e => {
+      if (G_PLAY && G_PLAY.stopped) return 'stopped';
+      console.warn('Gemini voices failed, using other voices', e);
+      S.gTTSOff = true;   /* don't keep waiting on a failing service this session */
+      return playFallback(lines, onLine);
+    });
+  }
+  return playFallback(lines, onLine);
+}
+function playFallback(lines, onLine){
   if (C.tts && !S.ttsOff) {
     const map = {}; let vi = 0;
     const L = lines.slice(0,100).map((l,i) => { if (!(l.speaker in map)) map[l.speaker] = VOICES[vi++ % 4]; return {text:l.text.slice(0,2000), voice:map[l.speaker], language:'en', id:'l'+i}; });
@@ -773,34 +880,51 @@ function playScript(lines, onLine){
   }
   return playBrowser(lines, onLine);
 }
+/* browser voices: prefer natural-sounding ones and match the speaker's gender by voice name */
+const F_RX = /female|zira|aria|jenny|michelle|emma|ava\b|sonia|libby|natasha|clara|samantha|karen|moira|tessa|serena|susan|hazel|heera|catherine|linda|sara|nancy|elizabeth|amber|ashley|cora|monica|jane|joanna|kendra|kimberly|salli|ivy|olivia|amy\b|aoede|kore|leda/i;
+const M_RX = /\bmale|david|mark\b|guy\b|ryan|eric\b|christopher|roger|steffan|andrew|brian|liam|william|thomas|daniel|alex\b|fred\b|george|james|richard|sean\b|tony\b|davis|jason|aaron|matthew|justin|joey|oliver|arthur|charon|puck/i;
+function voiceRank(v){ return (/natural|online|neural|premium|enhanced/i.test(v.name) ? 4 : /google/i.test(v.name) ? 3 : 0) + (/en-CA/i.test(v.lang) ? 1 : /en-(US|GB)/i.test(v.lang) ? 0.5 : 0); }
+function browserVoices(){
+  const ss = window.speechSynthesis, now = ss.getVoices();
+  if (now.length) return Promise.resolve(now);
+  return new Promise(res => {
+    const t = setTimeout(() => res(ss.getVoices()), 1200);
+    ss.addEventListener && ss.addEventListener('voiceschanged', () => { clearTimeout(t); res(ss.getVoices()); }, {once:true});
+  });
+}
 function playBrowser(lines, onLine){
-  return new Promise((res, rej) => {
-    const ss = window.speechSynthesis;
-    if (!ss || typeof SpeechSynthesisUtterance === 'undefined') return rej({code:'no_audio'});
+  const ss = window.speechSynthesis;
+  if (!ss || typeof SpeechSynthesisUtterance === 'undefined') return Promise.reject({code:'no_audio'});
+  return browserVoices().then(voices => new Promise(res => {
     ss.cancel();
-    const voices = ss.getVoices().filter(v => /^en/i.test(v.lang));
+    const all = voices.filter(v => /^en/i.test(v.lang)).sort((a, b) => voiceRank(b) - voiceRank(a));
+    const fem = all.filter(v => F_RX.test(v.name)), mal = all.filter(v => !F_RX.test(v.name) && M_RX.test(v.name));
+    const cast = castVoices(lines, fem, mal);
     const chunks = [];
     lines.forEach((l, i) => (l.text.match(/[^.!?]+[.!?]*\s*/g) || [l.text]).reduce((acc, s) => {
       if (acc.length && (acc[acc.length-1] + s).length < 220) acc[acc.length-1] += s; else acc.push(s); return acc;
     }, []).forEach(t => chunks.push({t, i, l})));
-    const map = {}; let vi = 0, k = 0;
+    let k = 0;
     const next = () => {
       if (k >= chunks.length) return res();
       const {t, i, l} = chunks[k];
-      if (!(l.speaker in map)) map[l.speaker] = vi++;
       const u = new SpeechSynthesisUtterance(t);
       u.lang = 'en-CA';
-      if (voices.length) u.voice = voices[map[l.speaker] % voices.length];
-      u.pitch = l.gender === 'female' ? 1.15 : 0.85; u.rate = 1;
+      const v = cast[l.speaker] || all[0];
+      if (v) u.voice = v;
+      /* shift pitch only when no voice of the right gender exists on this device */
+      const g = genderOf(l);
+      u.pitch = cast[l.speaker] ? 1 : (g === 'female' ? 1.2 : g === 'male' ? 0.8 : 1); u.rate = 1;
       u.onstart = () => onLine && onLine(i);
       u.onend = () => { k++; next(); };
       u.onerror = e => { if (e.error === 'interrupted' || e.error === 'canceled') res('stopped'); else { k++; next(); } };
       ss.speak(u);
     };
     next();
-  });
+  }));
 }
 function stopAudio(){
+  try { if (G_PLAY) { G_PLAY.stopped = true; if (G_PLAY.audio) G_PLAY.audio.pause(); if (G_PLAY.stopAt) G_PLAY.stopAt(); } } catch(e) {}
   try { if (C.tts && C.tts.active()) C.tts.stop().catch(()=>{}); } catch(e) {}
   try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch(e) {}
 }
@@ -1007,6 +1131,7 @@ function viewSettings(){
       <label class="small" for="gModel">Main model</label><input id="gModel" class="field" value="${esc(a.geminiModel)}" ${dis}>
       <label class="small" for="gBackup">Backup model (used when the main one fails or hits its limit; leave empty for none)</label><input id="gBackup" class="field" value="${esc(a.geminiBackup || '')}" ${dis}>
       <p class="small muted">Use the exact model ID from AI Studio, for example gemini-3.5-flash-lite or gemma-4-31b-it.</p>
+      <label class="opt"><input type="checkbox" id="gTTS" ${a.geminiTTS !== false ? 'checked' : ''} ${dis}><span><b>Use Google's natural voices for Listening</b><br><span class="small muted">Women and men get matching voices. Uses your Gemini key; if it fails, the app switches to the voices built into your browser.</span></span></label>
     </div>
     <div class="card"><h3>Claude API</h3>
       <p class="small muted">Create a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>. Usage is billed to that account.</p>
@@ -1042,7 +1167,7 @@ function accountCard(){
 }
 function readAIInputs(){
   const v = id => { const el = $('#' + id); return el ? el.value.trim() : null; };
-  if (v('gKey') !== null) { S.ai.geminiKey = v('gKey'); S.ai.geminiModel = v('gModel') || AI_DEFAULTS.geminiModel; S.ai.geminiBackup = v('gBackup') || ''; }
+  if (v('gKey') !== null) { S.ai.geminiKey = v('gKey'); S.ai.geminiModel = v('gModel') || AI_DEFAULTS.geminiModel; S.ai.geminiBackup = v('gBackup') || ''; const t = $('#gTTS'); if (t) { S.ai.geminiTTS = t.checked; S.gTTSOff = false; } }
   if (v('aKey') !== null) { S.ai.anthropicKey = v('aKey'); S.ai.anthropicModel = v('aModel') || AI_DEFAULTS.anthropicModel; }
   S.ai.ts = Date.now();
   saveAI(); pushAI();
@@ -1227,8 +1352,10 @@ function renderListening(data, p){
       <li>Choose the best answer to each question.</li>
       ${mock ? '' : '<li>Practice mode: you can replay the recording and read each question on screen.</li>'}</ul></div>`);
     setNext(() => listen());
+    prefetchVoices(segs[0].script);
   }
   function listen(){
+    if (seg > 0) prefetchVoices(segs[seg].script);
     const lines = segs[seg].script;
     const speakers = [...new Set(lines.map(l => l.speaker))];
     shell(`<div class="card">
@@ -1240,11 +1367,13 @@ function renderListening(data, p){
       <div id="fallback" hidden></div>
       ${mock ? '' : '<div class="row" style="justify-content:center"><button class="btn" id="replay" hidden>↻ Replay</button></div>'}
     </div>`);
+    prefetchVoices(segs[seg].questions.map(q => ({speaker:'Narrator', gender:'female', text:q.q})));
     const go = () => { stopAudio(); questions(0); };
     setNext(mock ? null : go);
     const start = () => {
-      const l = $('#sbLabel'); if (l) l.textContent = 'Playing…';
+      const l = $('#sbLabel'); if (l) l.textContent = useGeminiVoices() ? 'Preparing the audio…' : 'Playing…';
       playScript(lines, i => {
+        const sl = $('#sbLabel'); if (sl && sl.textContent !== 'Playing…') sl.textContent = 'Playing…';
         const pb = $('#pb'); if (pb) pb.style.width = Math.round((i + 1) / lines.length * 100) + '%';
         const n = $('#now'); if (n && lines[i]) n.textContent = lines[i].speaker + ' is speaking';
         if (lines[i]) $$('.person').forEach(x => x.classList.toggle('talk', x.dataset.sp === lines[i].speaker));

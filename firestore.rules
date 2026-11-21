@@ -1,0 +1,28 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Only these Google accounts may use the app's cloud storage.
+    // The live rules in the Firebase console list the real address; replace the placeholder to reuse this file.
+    function allowed() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.email in ['YOUR_EMAIL@gmail.com'];
+    }
+    function isOwner(uid) {
+      return allowed() && request.auth.uid == uid;
+    }
+    // Each person reads and writes only their own records, in the app's exact format.
+    match /data/users/{uid}/{doc} {
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['kind', 'ts', 'body'])
+        && request.resource.data.kind is string && request.resource.data.kind.size() <= 20
+        && request.resource.data.ts is number
+        && request.resource.data.body is string && request.resource.data.body.size() <= 500000;
+    }
+    // Everything else is closed.
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}

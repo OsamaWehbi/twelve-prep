@@ -264,7 +264,7 @@ const S = {view:'home', attempts:[], mocks:{}, settings:{target:8}, timed:true, 
 /* ---------- AI provider settings ---------- */
 const IN_ARTIFACT = !!(window.claude && window.claude.use);
 const AIKEY = 'twelve-prep-ai';
-const AI_DEFAULTS = {provider:'auto', geminiKey:'', geminiModel:'gemini-3.5-flash-lite', geminiBackup:'gemma-4-31b-it', anthropicKey:'', anthropicModel:'claude-opus-5-5'};
+const AI_DEFAULTS = {provider:'auto', geminiKey:'', geminiModel:'gemini-3.5-flash-lite', geminiBackup:'gemma-4-31b-it', anthropicKey:'', anthropicModel:'claude-opus-5-5', geminiGen:'', geminiWrite:'gemini-4-carbon', geminiSpeak:'gemini-4-carbon', geminiScoreBackup:'gemini-3.8-flash', audioScoring:true};
 S.ai = (() => { try { return {...AI_DEFAULTS, ...JSON.parse(localStorage.getItem(AIKEY) || '{}')}; } catch(e) { return {...AI_DEFAULTS}; } })();
 function saveAI(){ try { localStorage.setItem(AIKEY, JSON.stringify(S.ai)); } catch(e) {} }
 /* appearance: light by default (like test day), dark, or follow the device */
@@ -424,33 +424,57 @@ function pushAI(){ if (CLOUD.user && S.ui.syncAI && C.db) coll().doc('ai-prefs')
 const SYNC_NAME = () => IN_ARTIFACT ? 'Claude account' : 'Google account';
 
 /* ---------- Claude calls ---------- */
-async function askRaw(prompt, json){
+/* which Gemini models to try for each job, best first; specialist models that fail are skipped for a while */
+const MODEL_SKIP = {};
+function geminiChain(task){
+  const a = S.ai, t = x => (x || '').trim();
+  const lead = task === 'write' ? [t(a.geminiWrite), t(a.geminiScoreBackup)] : task === 'speak' ? [t(a.geminiSpeak), t(a.geminiScoreBackup)] : task === 'gen' ? [t(a.geminiGen)] : [];
+  const base = [t(a.geminiModel) || AI_DEFAULTS.geminiModel, t(a.geminiBackup)];
+  const out = [];
+  lead.forEach(m => { if (m && !out.includes(m) && !base.includes(m) && !(MODEL_SKIP[m] > Date.now())) out.push({m, special:true}); });
+  base.forEach(m => { if (m && !out.some(x => x.m === m)) out.push({m, special:false}); });
+  return out;
+}
+const canHear = m => !/^gemma/i.test(m);
+/* opts: {task:'gen'|'write'|'speak', audio:{data, mime}, audioPrompt} */
+async function askRaw(prompt, json, opts){
+  opts = opts || {};
   await readyP;
   const p = provider();
   if (!p) throw {code:'no_provider'};
   if (p === 'claude-account') {
-    return json ? C.sample.json(prompt, {modelTier:'default', cache:false}) : (await C.sample(prompt, {modelTier:'default', cache:false})).text;
+    const tier = opts.task === 'write' || opts.task === 'speak' ? 'complex' : 'default';
+    return json ? C.sample.json(prompt, {modelTier:tier, cache:false}) : (await C.sample(prompt, {modelTier:tier, cache:false})).text;
   }
   if (p === 'gemini') {
-    const models = [S.ai.geminiModel, S.ai.geminiBackup].map(m => (m || '').trim()).filter(Boolean);
-    if (!models.length) models.push(AI_DEFAULTS.geminiModel);
-    const attempts = models.length > 1 ? models : [models[0], models[0]];
+    const chain = geminiChain(opts.task);
+    const plain = chain.filter(x => !x.special);
+    const attempts = plain.length > 1 ? chain : [...chain, plain[0]];   /* with one main model, retry it once */
     const fallThrough = ['rate_limited','invalid_json','truncated','empty_completion','upstream_error','bad_model','refused','network'];
     let lastErr;
     for (let i = 0; i < attempts.length; i++) {
-      const m = attempts[i];
+      const {m, special} = attempts[i];
+      const audio = opts.audio && canHear(m) ? opts.audio : null;
+      const text0 = audio && opts.audioPrompt ? opts.audioPrompt : prompt;
       try {
-        const text = await callGeminiPatient(prompt, json, m);
+        /* specialist models get one quick try (no waiting); the main model gets the patient retry */
+        const text = special ? await callGemini(text0, json, m, audio) : await callGeminiPatient(text0, json, m, audio);
         if (!json) return text;
         const v = parseLoose(text);
-        if (v !== undefined) return v;
+        if (v !== undefined) { if (v && typeof v === 'object' && !Array.isArray(v)) Object.defineProperty(v, '_model', {value:m, enumerable:false}); return v; }
         console.warn('Unreadable reply from ' + m + ':', text.slice(0, 500));
         lastErr = {code:'invalid_json', who:'Gemini', detail:text.slice(0, 160)};
       } catch (e) {
         lastErr = e;
+        if (special) {
+          /* not on this key's plan, unknown, or over its limit: skip it for a while and use the next model */
+          if (['rate_limited','bad_model','bad_key','api_error'].includes(e.code)) MODEL_SKIP[m] = Date.now() + (e.code === 'rate_limited' && (e.retryAfter || 0) < 90 ? 2 : 30) * 60000;
+          console.warn('Gemini model ' + m + ' unavailable (' + e.code + '), using the next one');
+          continue;
+        }
         if (!fallThrough.includes(e.code)) throw e;
-        if (models.length === 1 && (e.code === 'rate_limited' || e.code === 'bad_model' || e.code === 'network')) throw e;
-        console.warn('Gemini model ' + m + ' failed (' + e.code + ')' + (i < attempts.length - 1 ? ', trying ' + attempts[i+1] : ''));
+        if (plain.length === 1 && (e.code === 'rate_limited' || e.code === 'bad_model' || e.code === 'network')) throw e;
+        console.warn('Gemini model ' + m + ' failed (' + e.code + ')' + (i < attempts.length - 1 ? ', trying ' + attempts[i+1].m : ''));
       }
     }
     throw lastErr;
@@ -486,8 +510,8 @@ function repairJSON(s){
   }
   return out.replace(/,\s*([}\]])/g, '$1');
 }
-const askJSON = prompt => askRaw(prompt, true);
-const askText = prompt => askRaw(prompt, false);
+const askJSON = (prompt, opts) => askRaw(prompt, true, opts);
+const askText = (prompt, opts) => askRaw(prompt, false, opts);
 function parseLoose(t){
   const tries = [t];
   const f = t.match(/```(?:json)?\s*([\s\S]*?)```/i); if (f) tries.push(f[1]);
@@ -513,27 +537,27 @@ async function httpErr(res, who){
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 /* one patient retry: waits out a short per-minute limit or a brief server hiccup */
-async function callGeminiPatient(prompt, json, model){
-  try { return await callGemini(prompt, json, model); }
+async function callGeminiPatient(prompt, json, model, audio){
+  try { return await callGemini(prompt, json, model, audio); }
   catch (e) {
     if (e.code === 'rate_limited') {
       const wait = Math.min(45, Math.max(8, e.retryAfter || 15));
       console.warn(`Gemini per-minute limit hit; waiting ${wait}s then retrying ${model}`);
       await sleep(wait * 1000);
-      return callGemini(prompt, json, model);
+      return callGemini(prompt, json, model, audio);
     }
-    if (e.code === 'upstream_error' || e.code === 'network' || e.code === 'empty_completion') { await sleep(3000); return callGemini(prompt, json, model); }
+    if (e.code === 'upstream_error' || e.code === 'network' || e.code === 'empty_completion') { await sleep(3000); return callGemini(prompt, json, model, audio); }
     throw e;
   }
 }
-async function callGemini(prompt, json, model){
+async function callGemini(prompt, json, model, audio){
   const jsonMode = json && !/^gemma/i.test(model);
   let res;
   try {
     res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method:'POST',
       headers:{'Content-Type':'application/json', 'x-goog-api-key':S.ai.geminiKey.trim()},
-      body:JSON.stringify({contents:[{role:'user', parts:[{text:prompt}]}], generationConfig: jsonMode ? {responseMimeType:'application/json'} : {}})
+      body:JSON.stringify({contents:[{role:'user', parts: audio ? [{inline_data:{mime_type:audio.mime, data:audio.data}}, {text:prompt}] : [{text:prompt}]}], generationConfig: jsonMode ? {responseMimeType:'application/json'} : {}})
     });
   } catch(e) { throw {code:'network', who:'Gemini'}; }
   if (!res.ok) throw await httpErr(res, 'Gemini');
@@ -648,7 +672,7 @@ function validMC(q, n=4){
 }
 async function genPart(section, p, run){
   if (section === 'listening') {
-    const d = await askJSON(listeningPrompt(p));
+    const d = await askJSON(listeningPrompt(p), {task:'gen'});
     if (!d || !Array.isArray(d.segments)) throw {code:'bad_content'};
     d.segments = d.segments.filter(s => Array.isArray(s.script) && s.script.length).map(s => ({
       script: s.script.filter(l => l && l.text).map(l => ({speaker:String(l.speaker||'Speaker'), gender:l.gender, text:String(l.text)})),
@@ -658,7 +682,7 @@ async function genPart(section, p, run){
     return d;
   }
   if (section === 'reading') {
-    const d = await askJSON(readingPrompt(p));
+    const d = await askJSON(readingPrompt(p), {task:'gen'});
     if (!d || !Array.isArray(d.passages) || !Array.isArray(d.questions)) throw {code:'bad_content'};
     const n = p.key === 'R3' ? 5 : 4;
     d.questions = d.questions.filter(q => validMC(q, n)).map(q => ({...q, answer:+q.answer, blank: q.blank == null || q.blank === '' ? null : +q.blank}));
@@ -666,7 +690,7 @@ async function genPart(section, p, run){
     return d;
   }
   if (section === 'writing') {
-    const d = await askJSON(writingPrompt(p));
+    const d = await askJSON(writingPrompt(p), {task:'gen'});
     if (!d || (p.key === 'W1' ? !d.situation : !d.optionA)) throw {code:'bad_content'};
     return d;
   }
@@ -679,7 +703,7 @@ async function genPart(section, p, run){
 }
 function speakingSet(run){
   if (!run.cache.set) {
-    run.cache.set = askJSON(speakingPrompt()).then(s => { if (!s || !s.t1 || !s.t7) throw {code:'bad_content'}; return s; });
+    run.cache.set = askJSON(speakingPrompt(), {task:'gen'}).then(s => { if (!s || !s.t1 || !s.t7) throw {code:'bad_content'}; return s; });
     run.cache.set.catch(() => { run.cache.set = null; });
   }
   return run.cache.set;
@@ -687,7 +711,7 @@ function speakingSet(run){
 function speakingSvg(run, which, desc){
   const k = 'svg_' + which;
   if (!run.cache[k]) {
-    run.cache[k] = askText(svgPrompt(desc || 'a busy park on a sunny day')).then(t => {
+    run.cache[k] = askText(svgPrompt(desc || 'a busy park on a sunny day'), {task:'gen'}).then(t => {
       const m = t.match(/<svg[\s\S]*<\/svg>/i); if (!m) throw {code:'bad_content'};
       let svg = m[0].replace(/<script[\s\S]*?<\/script>/gi,'').replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi,'').replace(/\son\w+\s*=\s*("[^"]*"|'[^']*')/gi,'');
       if (!/xmlns=/.test(svg)) svg = svg.replace(/<svg/i, '<svg xmlns="http://www.w3.org/2000/svg"');
@@ -713,12 +737,14 @@ function buildSpeakingTask(key, s, img){
 
 /* ---------- scoring ---------- */
 const LEVELS = `CELPIP levels: 12-11 advanced: fluent, precise, sophisticated, virtually error-free. 10 highly effective with rare slips. 9 effective: good range, occasional minor errors. 8 good: generally clear, some errors that do not impede meaning, decent range. 7 adequate: completes the task but with limited range, noticeable errors, simple organisation. 6 developing: frequent errors, basic vocabulary. 5 acquiring. 4 and below: limited. Be a strict, realistic CELPIP rater. Never inflate scores.`;
-function scorePrompt(r, kind){
+function scorePrompt(r, kind, withAudio){
   const target = S.settings.target;
   const dims = kind === 'writing' ? ['Content/Coherence','Vocabulary','Readability','Task Fulfillment'] : ['Content/Coherence','Vocabulary','Listenability','Task Fulfillment'];
   const desc = kind === 'writing'
     ? `CELPIP Writing is rated on: Content/Coherence (number and quality of ideas, organisation, supporting details), Vocabulary (range, precision, natural word choice), Readability (paragraphing, connectors, grammar, sentence variety), Task Fulfillment (covers every required point, right tone and register, 150-200 words).`
-    : `CELPIP Speaking is rated on: Content/Coherence (ideas, organisation, examples), Vocabulary (range and precision), Listenability (grammar, sentence variety, connectors, natural flow), Task Fulfillment (answers what was asked, uses the time well). The response below is a speech-to-text transcript or typed version of what the test taker said: ignore punctuation and capitalisation, and do not judge pronunciation.
+    : `CELPIP Speaking is rated on: Content/Coherence (ideas, organisation, examples), Vocabulary (range and precision), Listenability (grammar, sentence variety, connectors, natural flow${withAudio ? ', pronunciation, intonation, pace and pausing' : ''}), Task Fulfillment (answers what was asked, uses the time well). ${withAudio
+  ? `The AUDIO RECORDING of the test taker is attached. Listen to it and rate what you hear, the way a human CELPIP rater does. You may judge pronunciation, word stress, intonation, pace and pausing as part of Listenability. A non-native accent is fine and costs nothing as long as words are clear and easy to understand; lower the score only for sounds that make words hard to recognise. The text transcript below came from automatic speech recognition and may contain mistakes: trust the audio over the transcript. If the audio is silent or unclear, rate from the transcript.`
+  : `The response below is a speech-to-text transcript or typed version of what the test taker said: ignore punctuation and capitalisation, and do not judge pronunciation.`}
 Judge it as natural SPEECH, the way a human CELPIP rater listens, not as writing:
 - Fillers (uh, um, ah, er, you know, like, well, so) and short hesitations are normal; even level 10-11 speakers use some. A few fillers cost nothing. Lower Listenability only when fillers or restarts are so frequent that they break the flow (for example more than about 1 in 8 words).
 - Self-corrections ("I go, I went"), repeated words and false starts are normal spoken behaviour, not grammar errors. Judge the corrected version.
@@ -736,15 +762,21 @@ RESPONSE (${r.wc} words):
 """${r.response || '(no response)'}"""
 If the response is empty, extremely short or off-topic, give a low level (0-4).
 Reply with only JSON:
-{"level":<integer 0-12 overall>,"dimensions":[${dims.map(d=>`{"name":"${d}","level":<0-12>,"comment":"1-2 sentences"}`).join(',')}],"summary":"2 sentences","strengths":["..."],"improvements":["specific and actionable, up to 4"],"corrections":[{"original":"exact words from the response","better":"corrected or more natural version","why":"short reason"}],"upgrades":["3 phrases or sentence patterns that would sound like level ${Math.min(12,target+1)}"],"model_answer":"a level 10-11 ${kind==='writing'?'response':'spoken response'} to the same task, ${modelLen}"}
-Give up to 8 corrections, most important first.`;
+{${withAudio ? '"transcript":"word-for-word transcript of the audio, including fillers",' : ''}"level":<integer 0-12 overall>,"dimensions":[${dims.map(d=>`{"name":"${d}","level":<0-12>,"comment":"1-2 sentences"}`).join(',')}],"summary":"2 sentences","strengths":["..."],"improvements":["specific and actionable, up to 4"],"corrections":[{"original":"exact words from the response","better":"corrected or more natural version","why":"short reason"}],"upgrades":["3 phrases or sentence patterns that would sound like level ${Math.min(12,target+1)}"],"model_answer":"a level 10-11 ${kind==='writing'?'response':'spoken response'} to the same task, ${modelLen}"}
+Give up to 8 corrections, most important first.${withAudio ? ' Add up to 3 pronunciation tips to "improvements" if any words were unclear, naming the word and how to say it.' : ''}`;
 }
 function score(r, kind){
   r.err = null;
+  const clip = kind === 'speaking' && provider() === 'gemini' && S.ai.audioScoring !== false ? CLIPS.get(r) : null;
   const prompt = scorePrompt(r, kind);
+  const opts = {task: kind === 'writing' ? 'write' : 'speak'};
+  if (clip) { opts.audio = clip; opts.audioPrompt = scorePrompt(r, kind, true); }
   const fatal = ['no_provider','no_sample','bad_key','bad_model','not_granted','sampling_disabled','session_expired'];
-  r.scoring = askJSON(prompt).catch(e => fatal.includes(e && e.code) ? Promise.reject(e) : sleep(3000).then(() => askJSON(prompt))).then(fb => {
+  r.scoring = askJSON(prompt, opts).catch(e => fatal.includes(e && e.code) ? Promise.reject(e) : sleep(3000).then(() => askJSON(prompt, opts))).then(fb => {
     if (!fb || !Number.isFinite(+fb.level)) throw {code:'invalid_json'};
+    if (fb._model) r.ratedBy = fb._model;
+    if (clip && fb.transcript) { r.heard = true; if (!r.response || r.response.length < 3) { r.response = String(fb.transcript); r.wc = words(r.response); } }
+    delete fb.transcript;
     fb.level = clamp(Math.round(+fb.level), 0, 12);
     fb.dimensions = Array.isArray(fb.dimensions) ? fb.dimensions : [];
     r.fb = fb; return fb;
@@ -947,6 +979,44 @@ function setupDictation(){
   });
 }
 
+/* voice recording for audio scoring (website / download version with Gemini). Clips stay in memory only, never saved. */
+const CLIPS = new WeakMap();
+let recState = null;
+function wantRecording(){ return !IN_ARTIFACT && S.ai.audioScoring !== false && provider() === 'gemini' && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) && typeof MediaRecorder !== 'undefined'; }
+async function recStart(){
+  if (recState || !wantRecording()) return;
+  const st = recState = {chunks:[], rec:null, stream:null, t0:Date.now()};
+  try {
+    st.stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true}});
+    if (recState !== st) { st.stream.getTracks().forEach(t => t.stop()); return; }
+    const type = ['audio/webm;codecs=opus','audio/ogg;codecs=opus','audio/mp4','audio/webm'].find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t));
+    st.rec = new MediaRecorder(st.stream, type ? {mimeType:type, audioBitsPerSecond:32000} : {audioBitsPerSecond:32000});
+    st.rec.ondataavailable = e => { if (e.data && e.data.size) st.chunks.push(e.data); };
+    st.rec.start(1000);
+  } catch(e) { console.warn('Recording not available', e); if (st.stream) st.stream.getTracks().forEach(t => t.stop()); if (recState === st) recState = null; }
+}
+function recStop(){
+  const st = recState; recState = null;
+  if (!st) return Promise.resolve(null);
+  return new Promise(res => {
+    const done = () => {
+      if (st.stream) st.stream.getTracks().forEach(t => t.stop());
+      if (!st.chunks.length) return res(null);
+      const raw = (st.rec && st.rec.mimeType || st.chunks[0].type || 'audio/webm').split(';')[0];
+      const mime = raw === 'audio/mp4' ? 'audio/m4a' : raw;
+      const blob = new Blob(st.chunks, {type:raw});
+      if (blob.size < 2000 || blob.size > 15e6) return res(null);
+      const fr = new FileReader();
+      fr.onload = () => res({mime, data:String(fr.result).split(',')[1], secs:Math.round((Date.now() - st.t0) / 1000)});
+      fr.onerror = () => res(null);
+      fr.readAsDataURL(blob);
+    };
+    if (st.rec && st.rec.state !== 'inactive') { st.rec.onstop = done; try { st.rec.stop(); } catch(e) { done(); } }
+    else done();
+  });
+}
+function recCancel(){ const st = recState; recState = null; if (st) { try { if (st.rec && st.rec.state !== 'inactive') st.rec.stop(); } catch(e) {} if (st.stream) st.stream.getTracks().forEach(t => t.stop()); } }
+
 /* browser speech recognition (downloaded version, Chrome / Edge / Safari) */
 const SR = !IN_ARTIFACT && (window.SpeechRecognition || window.webkitSpeechRecognition);
 let srRec = null, srWant = false;
@@ -968,6 +1038,11 @@ function srStart(ta){
     const p = $('#partial'); if (p) p.textContent = interim;
   };
   r.onerror = e => {
+    if (e.error === 'audio-capture' && recState) {
+      srWant = false;
+      const p = $('#partial'); if (p) p.textContent = 'Recording your voice. Your words will appear in the feedback after you finish.';
+      return;
+    }
     if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
       srWant = false; S.srOff = true;
       const b = $('#micbtn'); if (b) b.hidden = true;
@@ -1131,6 +1206,14 @@ function viewSettings(){
       <label class="small" for="gModel">Main model</label><input id="gModel" class="field" value="${esc(a.geminiModel)}" ${dis}>
       <label class="small" for="gBackup">Backup model (used when the main one fails or hits its limit; leave empty for none)</label><input id="gBackup" class="field" value="${esc(a.geminiBackup || '')}" ${dis}>
       <p class="small muted">Use the exact model ID from AI Studio, for example gemini-3.5-flash-lite or gemma-4-31b-it.</p>
+      <details class="small"${a.geminiWrite !== AI_DEFAULTS.geminiWrite || a.geminiSpeak !== AI_DEFAULTS.geminiSpeak || a.geminiGen ? ' open' : ''}><summary><b>Models for each job</b> (best first; if one is unavailable on your key or over its limit, the app uses the next)</summary>
+        <label class="small" for="gGen">Making tests (leave empty to use the main model)</label><input id="gGen" class="field" value="${esc(a.geminiGen || '')}" placeholder="${esc(a.geminiModel)}" ${dis}>
+        <label class="small" for="gWrite">Scoring Writing</label><input id="gWrite" class="field" value="${esc(a.geminiWrite || '')}" ${dis}>
+        <label class="small" for="gSpeak">Scoring Speaking</label><input id="gSpeak" class="field" value="${esc(a.geminiSpeak || '')}" ${dis}>
+        <label class="small" for="gSB">Second choice for scoring</label><input id="gSB" class="field" value="${esc(a.geminiScoreBackup || '')}" ${dis}>
+        <p class="small muted">After these, the main and backup models above are used.</p>
+      </details>
+      <label class="opt"><input type="checkbox" id="gAudio" ${a.audioScoring !== false ? 'checked' : ''} ${dis}><span><b>Score Speaking from my recorded voice</b><br><span class="small muted">Gemini listens to your recording, so it can rate pronunciation and pacing and fix words the speech recognition missed. The recording is sent to Google only for scoring and is not saved by this app.</span></span></label>
       <label class="opt"><input type="checkbox" id="gTTS" ${a.geminiTTS !== false ? 'checked' : ''} ${dis}><span><b>Use Google's natural voices for Listening</b><br><span class="small muted">Women and men get matching voices. Uses your Gemini key; if it fails, the app switches to the voices built into your browser.</span></span></label>
     </div>
     <div class="card"><h3>Claude API</h3>
@@ -1167,7 +1250,7 @@ function accountCard(){
 }
 function readAIInputs(){
   const v = id => { const el = $('#' + id); return el ? el.value.trim() : null; };
-  if (v('gKey') !== null) { S.ai.geminiKey = v('gKey'); S.ai.geminiModel = v('gModel') || AI_DEFAULTS.geminiModel; S.ai.geminiBackup = v('gBackup') || ''; const t = $('#gTTS'); if (t) { S.ai.geminiTTS = t.checked; S.gTTSOff = false; } }
+  if (v('gKey') !== null) { S.ai.geminiKey = v('gKey'); S.ai.geminiModel = v('gModel') || AI_DEFAULTS.geminiModel; S.ai.geminiBackup = v('gBackup') || ''; const t = $('#gTTS'); if (t) { S.ai.geminiTTS = t.checked; S.gTTSOff = false; } const au = $('#gAudio'); if (au) S.ai.audioScoring = au.checked; if (v('gWrite') !== null) { S.ai.geminiGen = v('gGen') || ''; S.ai.geminiWrite = v('gWrite') || ''; S.ai.geminiSpeak = v('gSpeak') || ''; S.ai.geminiScoreBackup = v('gSB') || ''; Object.keys(MODEL_SKIP).forEach(k => delete MODEL_SKIP[k]); } }
   if (v('aKey') !== null) { S.ai.anthropicKey = v('aKey'); S.ai.anthropicModel = v('aModel') || AI_DEFAULTS.anthropicModel; }
   S.ai.ts = Date.now();
   saveAI(); pushAI();
@@ -1306,6 +1389,7 @@ function finishPart(r){
 function quitRun(){
   stopAudio(); clearTimers();
   try { if (C.dict && C.dict.active()) C.dict.stop(); } catch(e) {}
+  recCancel();
   srStop(); srRec = null;
   dictTarget = null; S.run = null; S.view = 'home'; render();
 }
@@ -1576,7 +1660,7 @@ function renderSpeaking(task, p){
       ta.addEventListener('input', () => { $('#spkwc').textContent = words(ta.value) + ' words'; });
       const mb = $('#micbtn');
       if (mb) mb.onclick = () => {
-        if (!C.dict) { if (srWant) srStop(); else srStart(ta); return; }
+        if (!C.dict) { if (srWant) srStop(); else { recStart(); srStart(ta); } return; }
         if (C.dict.active()) { C.dict.stop().catch(() => {}); return; }
         dictTarget = ta;
         C.dict.start().catch(e => {
@@ -1592,12 +1676,14 @@ function renderSpeaking(task, p){
     if (finished) return; finished = true; clearTimers();
     try { if (C.dict && C.dict.active()) await C.dict.stop(); } catch(e) {}
     if (srWant || srRec) { srStop(); await new Promise(r => setTimeout(r, 700)); srRec = null; }
+    const clip = await recStop();
     const text = ($('#spk') && $('#spk').value || '').trim();
     dictTarget = null;
     if (S.run !== run) return;
     let taskText = task.taskText;
     if (p.key === 'S5') { const mine = choice === 'B' ? task.B : task.A, other = choice === 'B' ? task.A : task.B; taskText += ` The test taker chose "${mine.name}" (${(mine.details||[]).join('; ')}) over "${other.name}" (${(other.details||[]).join('; ')}).`; }
     const r = {type:'task', kind:'speaking', key:p.key, name:p.name, taskText, response:text, wc:words(text), secs:p.speak};
+    if (clip) CLIPS.set(r, clip);
     score(r, 'speaking'); finishPart(r);
   }
   draw();
@@ -1653,6 +1739,7 @@ function fbHTML(r, i){
   return `<div class="card">
     <div class="row between"><div><p class="eyebrow">${esc(r.name)}</p><p>${esc(fb.summary || '')}</p></div><div style="text-align:right"><span class="levelbig">${lv(fb.level)}</span><p class="small muted">estimated level</p></div></div>
     ${meter(fb.level, S.settings.target)}
+    ${r.ratedBy || r.heard ? `<p class="small muted">Rated by ${esc(r.ratedBy || 'the AI')}${r.heard ? ' · it listened to your recording' : ''}</p>` : ''}
     <div class="dims">${fb.dimensions.map(d => `<div><div class="dimhead"><span>${esc(d.name)}</span><span>${lv(d.level)}</span></div><div class="bar"><i style="width:${clamp(+d.level||0,0,12)/12*100}%"></i></div><p class="small muted">${esc(d.comment)}</p></div>`).join('')}</div>
     <div class="grid2"><div><h3>What worked</h3>${list(fb.strengths)}</div><div><h3>To reach CLB ${S.settings.target}+</h3>${list(fb.improvements)}</div></div>
     <h3>Corrections</h3>${corr}

@@ -610,7 +610,13 @@ function errMsg(e){
   return 'Something went wrong while talking to the AI. Try again.';
 }
 
-const GEN = `You are an expert item writer for the CELPIP-General test (Canadian English proficiency). Write ORIGINAL practice material that matches the authentic CELPIP format and difficulty (aimed at test takers between levels 7 and 10). Use Canadian settings, names, and spelling (colour, centre, neighbour, cheque). Never copy official test material. All JSON strings must be valid (escape double quotes).`;
+const GEN = `You are an expert item writer for the CELPIP-General test (Canadian English proficiency). Write ORIGINAL practice material that matches the authentic CELPIP format and difficulty (aimed at test takers between levels 7 and 10). Use Canadian settings, names, and spelling (colour, centre, neighbour, cheque). Never copy official test material. All JSON strings must be valid (escape double quotes).
+VOCABULARY (very important): the real test uses the everyday English that ordinary Canadians use at work, at home, in stores, in emails and on the local news. Write the way a normal adult speaks or writes, not like a novel, a textbook or a thesaurus.
+- Use mostly common, high-frequency words (roughly the 3,000 most common English words) and familiar everyday collocations and phrasal verbs (sort out, look into, run late, drop off, figure out, pick up, a good deal, on short notice).
+- Harder items should get their difficulty from ideas, implied meaning, attitude and detail, not from rare words. At most a few less common but still well-known words per passage (for example renovation, reimbursement, eligible, commute, deadline).
+- Never use rare, literary, archaic, poetic, academic or overly formal words, or words most native speakers would have to look up (for example: ameliorate, perfunctory, salubrious, quotidian, myriad, plethora, juxtapose, ubiquitous, burgeoning, exacerbate, egregious, nascent).
+- No idioms that sound old-fashioned or British-only; use natural Canadian everyday wording.
+- Multiple-choice options and gap-fill choices must also use common words; the challenge is choosing the option that fits the meaning, not knowing an unusual word.`;
 const MC_RULES = `Each multiple-choice question has exactly 4 options and one correct answer ("answer" is its 0-based index). Distractors must be plausible: words that were mentioned, wrong details, or partial truths. Spread the correct index evenly across 0-3.`;
 
 function listeningPrompt(p){
@@ -762,8 +768,8 @@ RESPONSE (${r.wc} words):
 """${r.response || '(no response)'}"""
 If the response is empty, extremely short or off-topic, give a low level (0-4).
 Reply with only JSON:
-{${withAudio ? '"transcript":"word-for-word transcript of the audio, including fillers",' : ''}"level":<integer 0-12 overall>,"dimensions":[${dims.map(d=>`{"name":"${d}","level":<0-12>,"comment":"1-2 sentences"}`).join(',')}],"summary":"2 sentences","strengths":["..."],"improvements":["specific and actionable, up to 4"],"corrections":[{"original":"exact words from the response","better":"corrected or more natural version","why":"short reason"}],"upgrades":["3 phrases or sentence patterns that would sound like level ${Math.min(12,target+1)}"],"model_answer":"a level 10-11 ${kind==='writing'?'response':'spoken response'} to the same task, ${modelLen}"}
-Give up to 8 corrections, most important first.${withAudio ? ' Add up to 3 pronunciation tips to "improvements" if any words were unclear, naming the word and how to say it.' : ''}`;
+{${withAudio ? '"transcript":"word-for-word transcript of the audio, including fillers",' : ''}"level":<integer 0-12 overall>,"dimensions":[${dims.map(d=>`{"name":"${d}","level":<0-12>,"comment":"1-2 sentences"}`).join(',')}],"summary":"2 sentences","strengths":["..."],"improvements":["specific and actionable, up to 4"],"corrections":[{"original":"exact words from the response","better":"corrected or more natural version","why":"short reason"}],"upgrades":["3 natural phrases or sentence patterns that would sound like level ${Math.min(12,target+1)}, using common words that Canadians really use, never rare or bookish vocabulary"],"model_answer":"a level 10-11 ${kind==='writing'?'response':'spoken response'} to the same task, ${modelLen}"}
+Give up to 8 corrections, most important first. In corrections, upgrades and model_answer, higher level means clearer, more precise and more natural everyday English, not rarer words: never suggest rare, literary or overly formal vocabulary.${withAudio ? ' Add up to 3 pronunciation tips to "improvements" if any words were unclear, naming the word and how to say it.' : ''}`;
 }
 function score(r, kind){
   r.err = null;

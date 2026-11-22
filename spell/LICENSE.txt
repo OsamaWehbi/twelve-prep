@@ -1,0 +1,2 @@
+typo.js 1.3.2 - Copyright Christopher Finke - BSD-3-Clause license (https://github.com/cfinke/Typo.js)
+en_CA.aff / en_CA.dic - en_CA Hunspell dictionary from SCOWL (http://wordlist.sourceforge.net), via the npm package dictionary-en-ca 3.0.0. See its README for the full copyright and license terms (permissive).

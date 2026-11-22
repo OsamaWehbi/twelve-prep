@@ -271,8 +271,25 @@ const S = {view:'home', attempts:[], mocks:{}, settings:{target:8}, timed:true, 
 /* ---------- AI provider settings ---------- */
 const IN_ARTIFACT = !!(window.claude && window.claude.use);
 const AIKEY = 'twelve-prep-ai';
-const AI_DEFAULTS = {provider:'auto', geminiKey:'', geminiModel:'gemini-3.5-flash-lite', geminiBackup:'gemma-4-31b-it', anthropicKey:'', anthropicModel:'claude-opus-5-5', geminiGen:'', geminiWrite:'gemini-4-carbon', geminiSpeak:'gemini-4-carbon', geminiScoreBackup:'gemini-3.8-flash', audioScoring:true};
-S.ai = (() => { try { return {...AI_DEFAULTS, ...JSON.parse(localStorage.getItem(AIKEY) || '{}')}; } catch(e) { return {...AI_DEFAULTS}; } })();
+const SCORE_MODELS = 'gemini-4-hydrogen, gemini-3.8-flash, gemini-3.6-flash, gemini-3-flash, gemini-2.5-flash';
+const AI_DEFAULTS = {provider:'auto', geminiKey:'', geminiModel:'gemini-3.5-flash-lite', geminiBackup:'gemma-4-31b-it, gemma-4-26b-it', anthropicKey:'', anthropicModel:'claude-opus-5-5', geminiGen:'gemini-3.5-flash-lite, gemini-3.1-flash-lite', geminiWrite:SCORE_MODELS, geminiSpeak:SCORE_MODELS, audioScoring:true};
+/* older versions picked models that are not on the free plan: move saved settings to the new lists */
+function migrateAI(a){
+  const t = x => String(x || '').trim();
+  if (!t(a.geminiWrite) || /carbon/i.test(a.geminiWrite) && !/,/.test(a.geminiWrite)) a.geminiWrite = SCORE_MODELS;
+  if (!t(a.geminiSpeak) || /carbon/i.test(a.geminiSpeak) && !/,/.test(a.geminiSpeak)) a.geminiSpeak = SCORE_MODELS;
+  if (!t(a.geminiGen)) a.geminiGen = AI_DEFAULTS.geminiGen;
+  if (t(a.geminiBackup) === 'gemma-4-31b-it') a.geminiBackup = AI_DEFAULTS.geminiBackup;
+  delete a.geminiScoreBackup;
+  return a;
+}
+document.addEventListener('click', e => {
+  if (!e.target || e.target.id !== 'gReset') return;
+  [['gModel', AI_DEFAULTS.geminiModel], ['gBackup', AI_DEFAULTS.geminiBackup], ['gGen', AI_DEFAULTS.geminiGen], ['gWrite', SCORE_MODELS], ['gSpeak', SCORE_MODELS]].forEach(([id, v]) => {
+    const el = document.getElementById(id); if (el) { el.value = v; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }
+  });
+});
+S.ai = migrateAI((() => { try { return {...AI_DEFAULTS, ...JSON.parse(localStorage.getItem(AIKEY) || '{}')}; } catch(e) { return {...AI_DEFAULTS}; } })());
 function saveAI(){ try { localStorage.setItem(AIKEY, JSON.stringify(S.ai)); } catch(e) {} }
 /* appearance: light by default (like test day), dark, or follow the device */
 const UIKEY = 'twelve-prep-ui';
@@ -337,7 +354,7 @@ function ingest(docs){
   const ai = docs.find(d => d.kind === 'ai');
   if (ai && CLOUD.user && (ai.ts || 0) > (S.ai.ts || 0)) {
     const {kind, id, ...rest} = ai;
-    S.ai = {...AI_DEFAULTS, ...rest}; S.ui.syncAI = true; saveAI(); saveUI();
+    S.ai = migrateAI({...AI_DEFAULTS, ...rest}); S.ui.syncAI = true; saveAI(); saveUI();
     if (S.view === 'settings') render();
   }
   if (S.view === 'home' || S.view === 'progress') render();
@@ -432,15 +449,75 @@ const SYNC_NAME = () => IN_ARTIFACT ? 'Claude account' : 'Google account';
 
 /* ---------- Claude calls ---------- */
 /* which Gemini models to try for each job, best first; specialist models that fail are skipped for a while */
-const MODEL_SKIP = {};
+/* a model that refused is remembered (also after a reload), so it is not asked again until its limit resets */
+const SKIPKEY = 'tp-model-skip';
+const MODEL_SKIP = (() => { try { const o = JSON.parse(localStorage.getItem(SKIPKEY) || '{}'), now = Date.now(); for (const k in o) if (!(o[k] > now)) delete o[k]; return o; } catch(e) { return {}; } })();
+function skipModel(m, ms){ MODEL_SKIP[m] = Date.now() + ms; try { localStorage.setItem(SKIPKEY, JSON.stringify(MODEL_SKIP)); } catch(e) {} }
+function clearSkips(){ Object.keys(MODEL_SKIP).forEach(k => delete MODEL_SKIP[k]); try { localStorage.removeItem(SKIPKEY); } catch(e) {} }
+const skipped = m => MODEL_SKIP[m] > Date.now();
+/* Google resets free daily limits at midnight Pacific time */
+function msToPacificMidnight(){
+  try {
+    const p = new Intl.DateTimeFormat('en-US', {timeZone:'America/Los_Angeles', hour:'numeric', minute:'numeric', second:'numeric', hourCycle:'h23'}).formatToParts(new Date());
+    const g = t => +((p.find(x => x.type === t) || {}).value || 0);
+    return (86400 - ((g('hour') % 24) * 3600 + g('minute') * 60 + g('second'))) * 1000 + 120000;
+  } catch(e) { return 6 * 3600000; }
+}
+function skipFor(e){
+  if (e.code === 'rate_limited') return e.zero ? 7 * 86400000 : e.perDay ? msToPacificMidnight() : Math.max(30, Math.min(120, e.retryAfter || 60)) * 1000;
+  if (e.code === 'bad_model') return 86400000;
+  return 0;
+}
+/* the model names this key can use (free to ask; cached for a day), so the app never calls a model that isn't there */
+let MODEL_LIST = null, MODEL_LIST_P = null;
+const keyTag = k => { let h = 0; for (const c of k) h = (h * 31 + c.charCodeAt(0)) | 0; return String(h); };
+function loadModelList(){
+  const k = (S.ai.geminiKey || '').trim();
+  if (!k || IN_ARTIFACT) return Promise.resolve(null);
+  if (MODEL_LIST && MODEL_LIST.tag === keyTag(k)) return Promise.resolve(MODEL_LIST.ids);
+  if (MODEL_LIST_P) return MODEL_LIST_P;
+  MODEL_LIST_P = (async () => {
+    const tag = keyTag(k);
+    try { const c = JSON.parse(localStorage.getItem('tp-models') || 'null'); if (c && c.tag === tag && Date.now() - c.at < 86400000 && c.ids.length) { MODEL_LIST = c; return c.ids; } } catch(e) {}
+    try {
+      const ids = []; let page = '';
+      for (let i = 0; i < 5; i++) {
+        const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000' + (page ? '&pageToken=' + encodeURIComponent(page) : ''), {headers:{'x-goog-api-key':k}});
+        if (!res.ok) return null;
+        const j = await res.json();
+        (j.models || []).forEach(m => { const meth = m.supportedGenerationMethods; if (!meth || meth.includes('generateContent')) ids.push(String(m.name || '').replace(/^models\//, '')); });
+        page = j.nextPageToken; if (!page) break;
+      }
+      if (!ids.length) return null;
+      MODEL_LIST = {tag, at:Date.now(), ids};
+      try { localStorage.setItem('tp-models', JSON.stringify(MODEL_LIST)); } catch(e) {}
+      return ids;
+    } catch(e) { return null; }
+    finally { MODEL_LIST_P = null; }
+  })();
+  return MODEL_LIST_P;
+}
+/* "gemini-2.5-flash-tts" also finds "gemini-2.5-flash-preview-tts", but never a -lite or -pro model */
+const EXTRA_OK = /^(preview|latest|exp|experimental|it|\d+|a\d+b|e\d+b)$/;
+function resolveModel(want){
+  const ids = MODEL_LIST && MODEL_LIST.ids;
+  if (!want || !ids) return want || null;
+  if (ids.includes(want)) return want;
+  const w = want.split('-');
+  const fits = ids.filter(id => { let k = 0; for (const x of id.split('-')) { if (k < w.length && x === w[k]) k++; else if (!EXTRA_OK.test(x)) return false; } return k === w.length; });
+  if (!fits.length) return null;
+  fits.sort((a, b) => (/preview|exp/.test(a) - /preview|exp/.test(b)) || a.length - b.length);
+  return fits[0];
+}
+const LIST = x => String(x || '').split(/[\s,]+/).filter(Boolean);
+/* models to try for a job, best first; ones resting after a refusal are left out */
 function geminiChain(task){
-  const a = S.ai, t = x => (x || '').trim();
-  const lead = task === 'write' ? [t(a.geminiWrite), t(a.geminiScoreBackup)] : task === 'speak' ? [t(a.geminiSpeak), t(a.geminiScoreBackup)] : task === 'gen' ? [t(a.geminiGen)] : [];
-  const base = [t(a.geminiModel) || AI_DEFAULTS.geminiModel, t(a.geminiBackup)];
-  const out = [];
-  lead.forEach(m => { if (m && !out.includes(m) && !base.includes(m) && !(MODEL_SKIP[m] > Date.now())) out.push({m, special:true}); });
-  base.forEach(m => { if (m && !out.some(x => x.m === m)) out.push({m, special:false}); });
-  return out;
+  const a = S.ai;
+  const lead = task === 'write' ? LIST(a.geminiWrite) : task === 'speak' ? LIST(a.geminiSpeak) : task === 'gen' ? LIST(a.geminiGen) : [];
+  const all = [];
+  for (const w of [...lead, ...LIST(a.geminiModel || AI_DEFAULTS.geminiModel), ...LIST(a.geminiBackup)]) { const m = resolveModel(w); if (m && !all.includes(m)) all.push(m); }
+  const live = all.filter(m => !skipped(m));
+  return live.length ? live : all.slice(-1);   /* everything is resting: still try the last backup */
 }
 const canHear = m => !/^gemma/i.test(m);
 /* opts: {task:'gen'|'write'|'speak', audio:{data, mime}, audioPrompt} */
@@ -454,13 +531,11 @@ async function askRaw(prompt, json, opts){
     return json ? C.sample.json(prompt, {modelTier:tier, cache:false}) : (await C.sample(prompt, {modelTier:tier, cache:false})).text;
   }
   if (p === 'gemini') {
+    await loadModelList();
     const chain = geminiChain(opts.task);
-    const plain = chain.filter(x => !x.special);
-    const attempts = plain.length > 1 ? chain : [...chain, plain[0]];   /* with one main model, retry it once */
-    const fallThrough = ['rate_limited','invalid_json','truncated','empty_completion','upstream_error','bad_model','refused','network'];
     let lastErr;
-    for (let i = 0; i < attempts.length; i++) {
-      const {m, special} = attempts[i];
+    for (let i = 0; i < chain.length; i++) {
+      const m = chain[i], special = i < chain.length - 1;   /* one quick try each; only the last one waits out a per-minute limit */
       const audio = opts.audio && canHear(m) ? opts.audio : null;
       const text0 = audio && opts.audioPrompt ? opts.audioPrompt : prompt;
       try {
@@ -473,15 +548,10 @@ async function askRaw(prompt, json, opts){
         lastErr = {code:'invalid_json', who:'Gemini', detail:text.slice(0, 160)};
       } catch (e) {
         lastErr = e;
-        if (special) {
-          /* not on this key's plan, unknown, or over its limit: skip it for a while and use the next model */
-          if (['rate_limited','bad_model','bad_key','api_error'].includes(e.code)) MODEL_SKIP[m] = Date.now() + (e.code === 'rate_limited' && (e.retryAfter || 0) < 90 ? 2 : 30) * 60000;
-          console.warn('Gemini model ' + m + ' unavailable (' + e.code + '), using the next one');
-          continue;
-        }
-        if (!fallThrough.includes(e.code)) throw e;
-        if (plain.length === 1 && (e.code === 'rate_limited' || e.code === 'bad_model' || e.code === 'network')) throw e;
-        console.warn('Gemini model ' + m + ' failed (' + e.code + ')' + (i < attempts.length - 1 ? ', trying ' + attempts[i+1].m : ''));
+        if (e.code === 'bad_key') throw e;
+        /* over its limit, not on this key's plan, or unknown: leave it alone until it resets and use the next model */
+        const ms = skipFor(e); if (ms) skipModel(m, ms);
+        console.warn('Gemini model ' + m + ' failed (' + e.code + (e.perDay ? ', daily limit' : e.zero ? ', not on the free plan' : '') + ')' + (special ? ', trying ' + chain[i+1] : ''));
       }
     }
     throw lastErr;
@@ -536,7 +606,8 @@ async function httpErr(res, who){
   if (res.status === 429) {
     let wait = parseFloat(res.headers.get('retry-after') || '') || 0;
     try { const d = (lastErrBody.error && lastErrBody.error.details || []).find(x => x.retryDelay); if (d) wait = parseFloat(d.retryDelay) || wait; } catch(e) {}
-    return {code:'rate_limited', who, retryAfter:wait};
+    const raw = JSON.stringify(lastErrBody);
+    return {code:'rate_limited', who, retryAfter:wait, perDay:/PerDay/i.test(raw), zero:/limit:\s*0\b|"quotaValue":\s*"0"/.test(raw)};
   }
   if (res.status === 404) return {code:'bad_model', who};
   if (res.status >= 500) return {code:'upstream_error', who};
@@ -547,7 +618,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function callGeminiPatient(prompt, json, model, audio){
   try { return await callGemini(prompt, json, model, audio); }
   catch (e) {
-    if (e.code === 'rate_limited') {
+    if (e.code === 'rate_limited' && !e.perDay && !e.zero) {
       const wait = Math.min(45, Math.max(8, e.retryAfter || 15));
       console.warn(`Gemini per-minute limit hit; waiting ${wait}s then retrying ${model}`);
       await sleep(wait * 1000);
@@ -811,10 +882,14 @@ const VOICES = ['buttery','airy','rounded','glassy'];
 const G_FEMALE = ['Kore','Aoede','Leda','Sulafat','Despina','Zephyr','Achernar','Vindemiatrix'];
 const G_MALE = ['Charon','Puck','Orus','Iapetus','Achird','Algieba','Schedar','Sadaltager'];
 const G_NARRATOR = 'Kore';
-const G_TTS_MODELS = ['gemini-3.8-flash-tts','gemini-3.8-flash-lite-tts'];
+/* free-tier voice models, each with its own daily limit; a refused one is left alone until Google resets it */
+const G_TTS_MODELS = ['gemini-3.8-flash-tts','gemini-3.8-flash-lite-tts','gemini-3.1-flash-tts','gemini-2.5-flash-tts'];
 const G_CACHE = new Map();
-let G_PLAY = null, G_SHAPE = 0;   /* which request shape the API accepted */
-function useGeminiVoices(){ return !IN_ARTIFACT && !S.gTTSOff && S.ai.geminiTTS !== false && !!(S.ai.geminiKey || '').trim(); }
+let G_PLAY = null;
+const ttsModels = () => G_TTS_MODELS.map(resolveModel).filter(Boolean);
+function useGeminiVoices(){
+  return !IN_ARTIFACT && !S.gTTSOff && S.ai.geminiTTS !== false && !!(S.ai.geminiKey || '').trim() && ttsModels().some(m => !skipped(m));
+}
 function genderOf(l){ const g = String(l.gender || '').toLowerCase(); return g.startsWith('f') ? 'female' : g.startsWith('m') ? 'male' : ''; }
 /* give each speaker a voice that matches their gender, all different within one script */
 function castVoices(lines, femalePool, malePool){
@@ -835,71 +910,103 @@ function pcmToWav(pcm, rate){
   d.setUint32(24, rate, true); d.setUint32(28, rate * 2, true); d.setUint16(32,2,true); d.setUint16(34,16,true); w(36,'data'); d.setUint32(40, pcm.length, true);
   return new Blob([h, pcm], {type:'audio/wav'});
 }
-async function geminiSpeak(text, voice){
-  const key = voice + '|' + text;
+/* a script becomes as few audio requests as possible: Google can voice two speakers in one request */
+function splitSegments(lines){
+  const segs = []; let cur = null;
+  lines.forEach((l, i) => {
+    if (!cur || (!cur.sp.includes(l.speaker) && cur.sp.length >= 2) || cur.chars + l.text.length > 5000) { cur = {sp:[], idx:[], chars:0}; segs.push(cur); }
+    if (!cur.sp.includes(l.speaker)) cur.sp.push(l.speaker);
+    cur.idx.push(i); cur.chars += l.text.length;
+  });
+  return segs;
+}
+function ttsBody(lines, seg, map){
+  const part = seg.idx.map(i => lines[i]);
+  if (seg.sp.length === 1)
+    return {contents:[{role:'user', parts:[{text:'Say in a natural, clear, conversational voice, at a normal pace:\n' + part.map(l => l.text).join('\n')}]}],
+      generationConfig:{responseModalities:['AUDIO'], speechConfig:{voiceConfig:{prebuiltVoiceConfig:{voiceName:map[seg.sp[0]]}}}}};
+  /* names the model can match to a voice: letters only, and different from each other */
+  const alias = {};
+  seg.sp.forEach((s, k) => { let a = String(s).replace(/[^A-Za-z]/g, '') || 'Speaker'; if (Object.values(alias).includes(a)) a += (k + 1); alias[s] = a; });
+  const [A, B] = seg.sp.map(s => alias[s]);
+  return {contents:[{role:'user', parts:[{text:`TTS the following conversation between ${A} and ${B}, in relaxed, natural everyday English at a normal pace:\n` + part.map(l => alias[l.speaker] + ': ' + l.text).join('\n')}]}],
+    generationConfig:{responseModalities:['AUDIO'], speechConfig:{multiSpeakerVoiceConfig:{speakerVoiceConfigs: seg.sp.map(s => ({speaker:alias[s], voiceConfig:{prebuiltVoiceConfig:{voiceName:map[s]}}}))}}}};
+}
+function geminiSegment(lines, seg, map){
+  const key = seg.idx.map(i => map[lines[i].speaker] + '|' + lines[i].speaker + '|' + lines[i].text).join('\n');
   if (G_CACHE.has(key)) return G_CACHE.get(key);
   const job = (async () => {
-    const style = 'natural, conversational everyday English at a normal, clear pace';
-    const bodies = [
-      {contents:[{role:'user', parts:[{text, speech_metadata:{style}}]}], generationConfig:{responseModalities:['AUDIO'], speechConfig:{voiceConfig:{voice}}}},
-      {contents:[{role:'user', parts:[{text}]}], generationConfig:{responseModalities:['AUDIO'], speechConfig:{voiceConfig:{prebuiltVoiceConfig:{voiceName:voice}}}}}
-    ];
-    let last = null;
-    for (const model of G_TTS_MODELS) {
-      for (let b = G_SHAPE; b < bodies.length; b++) {
-        const body = bodies[b];
-        let res;
-        try {
-          res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-            method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':S.ai.geminiKey.trim()}, body:JSON.stringify(body)});
-        } catch(e) { last = {code:'network'}; break; }
-        if (res.status === 400) { last = {code:'bad_request', status:400}; continue; }   /* try the other request shape */
-        if (res.status === 401 || res.status === 403) throw {code:'key', status:res.status};
-        if (!res.ok) { last = {code:'http', status:res.status}; break; }                 /* 404 / 429 / 5xx: next model */
-        const j = await res.json();
-        const part = ((((j.candidates || [])[0] || {}).content || {}).parts || []).find(x => x.inlineData || x.inline_data);
-        const inl = part && (part.inlineData || part.inline_data);
-        if (!inl || !inl.data) { last = {code:'empty'}; break; }
-        G_SHAPE = b;
-        const bytes = b64bytes(inl.data), mime = String(inl.mimeType || inl.mime_type || '');
-        const isWav = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46;
-        const rate = parseInt((mime.match(/rate=(\d+)/) || [])[1] || '24000', 10);
-        return URL.createObjectURL(isWav ? new Blob([bytes], {type:'audio/wav'}) : pcmToWav(bytes, rate));
+    await loadModelList();
+    const body = JSON.stringify(ttsBody(lines, seg, map));
+    let last = {code:'tts_exhausted'};
+    for (const model of ttsModels()) {
+      if (skipped(model)) continue;
+      let res;
+      try {
+        res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+          method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':S.ai.geminiKey.trim()}, body});
+      } catch(e) { throw {code:'network'}; }
+      if (!res.ok) {
+        const e = await httpErr(res, 'Gemini');
+        if (e.code === 'bad_key') { S.gTTSOff = true; throw e; }
+        const ms = skipFor(e); if (ms) skipModel(model, ms);
+        console.warn('Voice model ' + model + ' unavailable (' + e.code + (e.perDay ? ', daily limit' : '') + ')');
+        last = e; continue;
       }
+      const j = await res.json();
+      const p = ((((j.candidates || [])[0] || {}).content || {}).parts || []).find(x => x.inlineData || x.inline_data);
+      const inl = p && (p.inlineData || p.inline_data);
+      if (!inl || !inl.data) { last = {code:'empty'}; continue; }
+      const bytes = b64bytes(inl.data), mime = String(inl.mimeType || inl.mime_type || '');
+      const isWav = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46;
+      const rate = parseInt((mime.match(/rate=(\d+)/) || [])[1] || '24000', 10);
+      return URL.createObjectURL(isWav ? new Blob([bytes], {type:'audio/wav'}) : pcmToWav(bytes, rate));
     }
-    throw last || {code:'unavailable'};
+    throw last;
   })();
   G_CACHE.set(key, job);
-  job.catch(() => G_CACHE.delete(key));
+  job.catch(() => setTimeout(() => { if (G_CACHE.get(key) === job) G_CACHE.delete(key); }, 60000));   /* don't ask again right away */
   return job;
 }
-/* start making audio early so playback doesn't wait (2 requests at a time) */
+/* start making the audio while the instructions are on screen, one request at a time */
 function prefetchVoices(lines){
   if (!useGeminiVoices() || !lines || !lines.length) return;
   const map = castVoices(lines, G_FEMALE, G_MALE);
-  const jobs = lines.map(l => () => geminiSpeak(l.text.slice(0, 3000), map[l.speaker]).catch(() => {}));
-  let k = 0; const run = () => { if (k < jobs.length) jobs[k++]().then(run); };
-  run(); run();
+  splitSegments(lines).reduce((p, sg) => p.then(() => geminiSegment(lines, sg, map).catch(() => {})), Promise.resolve());
 }
 function playGemini(lines, onLine){
   const me = G_PLAY = {stopped:false, audio:null, stopAt:null};
   const map = castVoices(lines, G_FEMALE, G_MALE);
-  const get = i => geminiSpeak(lines[i].text.slice(0, 3000), map[lines[i].speaker]);
-  get(0); if (lines.length > 1) get(1);
+  const segs = splitSegments(lines);
+  const get = k => geminiSegment(lines, segs[k], map);
+  get(0).catch(() => {});
   return (async () => {
-    for (let i = 0; i < lines.length; i++) {
+    for (let k = 0; k < segs.length; k++) {
       if (me.stopped) return 'stopped';
-      const url = await get(i);
-      if (i + 2 < lines.length) get(i + 2).catch(() => {});   /* keep two lines ahead */
+      const idx = segs[k].idx;
+      let url;
+      try { url = await get(k); } catch(e) { throw {...e, at:idx[0]}; }
+      if (k + 1 < segs.length) get(k + 1).catch(() => {});
       if (me.stopped) return 'stopped';
-      onLine && onLine(i);
-      await new Promise((res, rej) => {
-        const a = me.audio = new Audio(url);
-        a.onended = res; a.onerror = () => rej({code:'play'}); me.stopAt = res;
-        a.play().catch(rej);
-      });
+      /* one audio holds several lines: follow along by each line's share of the text */
+      const w = idx.map(i => lines[i].text.length + 15), tot = w.reduce((a, b) => a + b, 0), starts = [];
+      w.reduce((acc, x) => { starts.push(acc / tot); return acc + x; }, 0);
+      let shown = -1;
+      const tick = a => {
+        const f = a.duration && isFinite(a.duration) ? a.currentTime / a.duration : 0;
+        let j = 0; while (j + 1 < starts.length && starts[j + 1] <= f) j++;
+        if (j !== shown) { shown = j; onLine && onLine(idx[j]); }
+      };
+      try {
+        await new Promise((res, rej) => {
+          const a = me.audio = new Audio(url);
+          a.ontimeupdate = () => tick(a); a.onplaying = () => tick(a);
+          a.onended = res; a.onerror = () => rej({code:'play'}); me.stopAt = res;
+          a.play().catch(rej);
+        });
+      } catch(e) { if (me.stopped) return 'stopped'; throw {code:'play', at:idx[0]}; }
       if (me.stopped) return 'stopped';
-      if (i < lines.length - 1 && lines[i + 1].speaker !== lines[i].speaker) await new Promise(r => setTimeout(r, 250));
+      if (k < segs.length - 1) await new Promise(r => setTimeout(r, 300));
     }
   })();
 }
@@ -907,9 +1014,10 @@ function playScript(lines, onLine){
   if (useGeminiVoices()) {
     return playGemini(lines, onLine).catch(e => {
       if (G_PLAY && G_PLAY.stopped) return 'stopped';
-      console.warn('Gemini voices failed, using other voices', e);
-      S.gTTSOff = true;   /* don't keep waiting on a failing service this session */
-      return playFallback(lines, onLine);
+      console.warn('Google voices unavailable, using other voices', e);
+      /* carry on from the line that failed, not from the start */
+      const at = Math.min(Math.max(0, (e && e.at) || 0), lines.length - 1);
+      return playFallback(lines.slice(at), onLine && (i => onLine(i + at)));
     });
   }
   return playFallback(lines, onLine);
@@ -927,44 +1035,57 @@ function playFallback(lines, onLine){
   }
   return playBrowser(lines, onLine);
 }
-/* browser voices: prefer natural-sounding ones and match the speaker's gender by voice name */
-const F_RX = /female|zira|aria|jenny|michelle|emma|ava\b|sonia|libby|natasha|clara|samantha|karen|moira|tessa|serena|susan|hazel|heera|catherine|linda|sara|nancy|elizabeth|amber|ashley|cora|monica|jane|joanna|kendra|kimberly|salli|ivy|olivia|amy\b|aoede|kore|leda/i;
-const M_RX = /\bmale|david|mark\b|guy\b|ryan|eric\b|christopher|roger|steffan|andrew|brian|liam|william|thomas|daniel|alex\b|fred\b|george|james|richard|sean\b|tony\b|davis|jason|aaron|matthew|justin|joey|oliver|arthur|charon|puck/i;
-function voiceRank(v){ return (/natural|online|neural|premium|enhanced/i.test(v.name) ? 4 : /google/i.test(v.name) ? 3 : 0) + (/en-CA/i.test(v.lang) ? 1 : /en-(US|GB)/i.test(v.lang) ? 0.5 : 0); }
+/* browser voices: prefer natural-sounding ones and match the speaker's gender by voice name.
+   Android (Google speech services) names voices by code, e.g. en-us-x-sfg = female, en-us-x-iom = male */
+const F_RX = /female|zira|aria|jenny|michelle|emma|ava\b|sonia|libby|natasha|clara|samantha|karen|moira|tessa|serena|susan|hazel|heera|catherine|linda|sara|nancy|elizabeth|amber|ashley|cora|monica|jane|joanna|kendra|kimberly|salli|ivy|olivia|amy\b|aoede|kore|leda|-x-(sfg|iob|iog|tpc|tpf|gba|gbc|gbg|aua|auc|afh|ena|enc|cxx)\b/i;
+const M_RX = /\bmale|david|mark\b|guy\b|ryan|eric\b|christopher|roger|steffan|andrew|brian|liam|william|thomas|daniel|alex\b|fred\b|george|james|richard|sean\b|tony\b|davis|jason|aaron|matthew|justin|joey|oliver|arthur|charon|puck|-x-(iol|iom|tpd|gbb|gbd|rjs|aub|aud|ahp|end|ene)\b/i;
+const vname = v => v.name + ' ' + (v.voiceURI || '');
+function voiceRank(v){ return (/natural|online|neural|premium|enhanced|network/i.test(vname(v)) ? 4 : /google/i.test(v.name) ? 3 : 0) + (/en[-_]CA/i.test(v.lang) ? 1 : /en[-_](US|GB)/i.test(v.lang) ? 0.5 : 0); }
 function browserVoices(){
   const ss = window.speechSynthesis, now = ss.getVoices();
   if (now.length) return Promise.resolve(now);
   return new Promise(res => {
-    const t = setTimeout(() => res(ss.getVoices()), 1200);
+    const t = setTimeout(() => res(ss.getVoices()), 2500);   /* Android Chrome lists its voices late */
     ss.addEventListener && ss.addEventListener('voiceschanged', () => { clearTimeout(t); res(ss.getVoices()); }, {once:true});
   });
 }
+let BR_TOKEN = null;
 function playBrowser(lines, onLine){
   const ss = window.speechSynthesis;
   if (!ss || typeof SpeechSynthesisUtterance === 'undefined') return Promise.reject({code:'no_audio'});
   return browserVoices().then(voices => new Promise(res => {
     ss.cancel();
+    const tok = BR_TOKEN = {};
     const all = voices.filter(v => /^en/i.test(v.lang)).sort((a, b) => voiceRank(b) - voiceRank(a));
-    const fem = all.filter(v => F_RX.test(v.name)), mal = all.filter(v => !F_RX.test(v.name) && M_RX.test(v.name));
-    const cast = castVoices(lines, fem, mal);
+    const fem = all.filter(v => F_RX.test(vname(v))), mal = all.filter(v => !F_RX.test(vname(v)) && M_RX.test(vname(v)));
+    const cast = castVoices(lines, fem, mal), shifted = {};
+    /* no voice of the right gender on this device (common on Android tablets): give each such speaker a
+       different English accent and shift the pitch, so the speakers still sound like different people */
+    const used = new Set(Object.values(cast).filter(Boolean)), spare = [], langs = new Set();
+    for (const v of all) { const lg = v.lang.toLowerCase().replace('_', '-'); if (!used.has(v) && !langs.has(lg)) { langs.add(lg); spare.push(v); } }
+    let si = 0;
+    for (const sp in cast) if (!cast[sp]) { shifted[sp] = true; if (spare.length) cast[sp] = spare[si++ % spare.length]; }
     const chunks = [];
     lines.forEach((l, i) => (l.text.match(/[^.!?]+[.!?]*\s*/g) || [l.text]).reduce((acc, s) => {
       if (acc.length && (acc[acc.length-1] + s).length < 220) acc[acc.length-1] += s; else acc.push(s); return acc;
     }, []).forEach(t => chunks.push({t, i, l})));
     let k = 0;
     const next = () => {
+      if (BR_TOKEN !== tok) return res('stopped');
       if (k >= chunks.length) return res();
       const {t, i, l} = chunks[k];
       const u = new SpeechSynthesisUtterance(t);
-      u.lang = 'en-CA';
       const v = cast[l.speaker] || all[0];
-      if (v) u.voice = v;
-      /* shift pitch only when no voice of the right gender exists on this device */
+      if (v) { u.voice = v; u.lang = v.lang; } else u.lang = 'en-CA';
       const g = genderOf(l);
-      u.pitch = cast[l.speaker] ? 1 : (g === 'female' ? 1.2 : g === 'male' ? 0.8 : 1); u.rate = 1;
+      u.pitch = shifted[l.speaker] ? (g === 'female' ? 1.25 : g === 'male' ? 0.8 : 1) : 1; u.rate = 1;
+      /* some Android voices never report the end of a sentence: move on after a generous wait */
+      let moved = false;
+      const go = () => { if (moved) return; moved = true; clearTimeout(wd); k++; next(); };
+      const wd = setTimeout(go, t.length * 95 + 6000);
       u.onstart = () => onLine && onLine(i);
-      u.onend = () => { k++; next(); };
-      u.onerror = e => { if (e.error === 'interrupted' || e.error === 'canceled') res('stopped'); else { k++; next(); } };
+      u.onend = go;
+      u.onerror = e => { if (e.error === 'interrupted' || e.error === 'canceled') { moved = true; clearTimeout(wd); res('stopped'); } else go(); };
       ss.speak(u);
     };
     next();
@@ -973,6 +1094,7 @@ function playBrowser(lines, onLine){
 function stopAudio(){
   try { if (G_PLAY) { G_PLAY.stopped = true; if (G_PLAY.audio) G_PLAY.audio.pause(); if (G_PLAY.stopAt) G_PLAY.stopAt(); } } catch(e) {}
   try { if (C.tts && C.tts.active()) C.tts.stop().catch(()=>{}); } catch(e) {}
+  BR_TOKEN = null;
   try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch(e) {}
 }
 
@@ -1249,17 +1371,17 @@ function viewSettings(){
       <p class="small muted">Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Free keys allow a limited number of requests per minute and per day, and Google may use free-tier prompts to improve its products.</p>
       <label class="small" for="gKey">API key</label><input id="gKey" type="password" class="field" value="${esc(a.geminiKey)}" autocomplete="off" ${dis}>
       <label class="small" for="gModel">Main model</label><input id="gModel" class="field" value="${esc(a.geminiModel)}" ${dis}>
-      <label class="small" for="gBackup">Backup model (used when the main one fails or hits its limit; leave empty for none)</label><input id="gBackup" class="field" value="${esc(a.geminiBackup || '')}" ${dis}>
-      <p class="small muted">Use the exact model ID from AI Studio, for example gemini-3.5-flash-lite or gemma-4-31b-it.</p>
-      <details class="small"${a.geminiWrite !== AI_DEFAULTS.geminiWrite || a.geminiSpeak !== AI_DEFAULTS.geminiSpeak || a.geminiGen ? ' open' : ''}><summary><b>Models for each job</b> (best first; if one is unavailable on your key or over its limit, the app uses the next)</summary>
-        <label class="small" for="gGen">Making tests (leave empty to use the main model)</label><input id="gGen" class="field" value="${esc(a.geminiGen || '')}" placeholder="${esc(a.geminiModel)}" ${dis}>
+      <label class="small" for="gBackup">Backup models (used when the others fail or hit their limit; separate with commas)</label><input id="gBackup" class="field" value="${esc(a.geminiBackup || '')}" ${dis}>
+      <p class="small muted">Use model IDs from AI Studio, for example gemini-3.5-flash-lite or gemma-4-31b-it.</p>
+      <details class="small"${a.geminiWrite !== AI_DEFAULTS.geminiWrite || a.geminiSpeak !== AI_DEFAULTS.geminiSpeak || a.geminiGen !== AI_DEFAULTS.geminiGen ? ' open' : ''}><summary><b>Models for each job</b> (best first, separated by commas)</summary>
+        <p class="small muted">Each free model has its own daily limit. When one is used up, the app moves to the next and doesn't ask it again until Google resets the limits (midnight Pacific time). After these lists, the main and backup models above are used.</p>
+        <label class="small" for="gGen">Making tests</label><input id="gGen" class="field" value="${esc(a.geminiGen || '')}" ${dis}>
         <label class="small" for="gWrite">Scoring Writing</label><input id="gWrite" class="field" value="${esc(a.geminiWrite || '')}" ${dis}>
         <label class="small" for="gSpeak">Scoring Speaking</label><input id="gSpeak" class="field" value="${esc(a.geminiSpeak || '')}" ${dis}>
-        <label class="small" for="gSB">Second choice for scoring</label><input id="gSB" class="field" value="${esc(a.geminiScoreBackup || '')}" ${dis}>
-        <p class="small muted">After these, the main and backup models above are used.</p>
+        <button type="button" class="btn ghost small" id="gReset" ${dis}>Use the recommended free models</button>
       </details>
       <label class="opt"><input type="checkbox" id="gAudio" ${a.audioScoring !== false ? 'checked' : ''} ${dis}><span><b>Score Speaking from my recorded voice</b><br><span class="small muted">Gemini listens to your recording, so it can rate pronunciation and pacing and fix words the speech recognition missed. The recording is sent to Google only for scoring and is not saved by this app.</span></span></label>
-      <label class="opt"><input type="checkbox" id="gTTS" ${a.geminiTTS !== false ? 'checked' : ''} ${dis}><span><b>Use Google's natural voices for Listening</b><br><span class="small muted">Women and men get matching voices. Uses your Gemini key; if it fails, the app switches to the voices built into your browser.</span></span></label>
+      <label class="opt"><input type="checkbox" id="gTTS" ${a.geminiTTS !== false ? 'checked' : ''} ${dis}><span><b>Use Google's natural voices for Listening</b><br><span class="small muted">Women and men get matching voices. Uses your Gemini key (one request per conversation; free keys allow about 40 a day across Google's four voice models). When they are used up, the app switches to the voices built into your device.</span></span></label>
     </div>
     <div class="card"><h3>Claude API</h3>
       <p class="small muted">Create a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>. Usage is billed to that account.</p>
@@ -1295,7 +1417,7 @@ function accountCard(){
 }
 function readAIInputs(){
   const v = id => { const el = $('#' + id); return el ? el.value.trim() : null; };
-  if (v('gKey') !== null) { S.ai.geminiKey = v('gKey'); S.ai.geminiModel = v('gModel') || AI_DEFAULTS.geminiModel; S.ai.geminiBackup = v('gBackup') || ''; const t = $('#gTTS'); if (t) { S.ai.geminiTTS = t.checked; S.gTTSOff = false; } const au = $('#gAudio'); if (au) S.ai.audioScoring = au.checked; if (v('gWrite') !== null) { S.ai.geminiGen = v('gGen') || ''; S.ai.geminiWrite = v('gWrite') || ''; S.ai.geminiSpeak = v('gSpeak') || ''; S.ai.geminiScoreBackup = v('gSB') || ''; Object.keys(MODEL_SKIP).forEach(k => delete MODEL_SKIP[k]); } }
+  if (v('gKey') !== null) { if (v('gKey') !== S.ai.geminiKey) { clearSkips(); MODEL_LIST = null; } S.ai.geminiKey = v('gKey'); S.ai.geminiModel = v('gModel') || AI_DEFAULTS.geminiModel; S.ai.geminiBackup = v('gBackup') || ''; const t = $('#gTTS'); if (t) { S.ai.geminiTTS = t.checked; S.gTTSOff = false; } const au = $('#gAudio'); if (au) S.ai.audioScoring = au.checked; if (v('gWrite') !== null) { S.ai.geminiGen = v('gGen') || ''; S.ai.geminiWrite = v('gWrite') || ''; S.ai.geminiSpeak = v('gSpeak') || ''; migrateAI(S.ai); } }
   if (v('aKey') !== null) { S.ai.anthropicKey = v('aKey'); S.ai.anthropicModel = v('aModel') || AI_DEFAULTS.anthropicModel; }
   S.ai.ts = Date.now();
   saveAI(); pushAI();
@@ -1496,7 +1618,6 @@ function renderListening(data, p){
       <div id="fallback" hidden></div>
       ${mock ? '' : '<div class="row" style="justify-content:center"><button class="btn" id="replay" hidden>↻ Replay</button></div>'}
     </div>`);
-    prefetchVoices(segs[seg].questions.map(q => ({speaker:'Narrator', gender:'female', text:q.q})));
     const go = () => { stopAudio(); questions(0); };
     setNext(mock ? null : go);
     const start = () => {
@@ -1555,7 +1676,7 @@ function renderListening(data, p){
       if (failed) { const t = $('#qtext'); if (t) t.hidden = false; }
       if (mock) partTimerSecs(30, advance);
     };
-    playScript([{speaker:'Narrator', gender:'female', text:q.q}], () => { const pb = $('#pb'); if (pb) pb.style.width = '50%'; })
+    playFallback([{speaker:'Narrator', gender:'female', text:q.q}], () => { const pb = $('#pb'); if (pb) pb.style.width = '50%'; })
       .then(() => afterAudio(false), () => afterAudio(true));
   }
   function finish(){

@@ -592,6 +592,7 @@ function errMsg(e){
   if (c === 'no_sample' || c === 'no_provider') return IN_ARTIFACT
     ? 'Tests are written by Claude. Open this page on claude.ai while signed in, then allow it to use Claude when asked.'
     : 'Choose an AI first: add a free Gemini API key or a Claude API key in Settings.';
+  if (c === 'no_speech') return 'No speech was captured, so this task was not rated (it does not count as 0). Check that this site is allowed to use the microphone (tap the lock icon next to the web address), press Start microphone when the recording begins, and try the task again.';
   if (c === 'bad_key') return `${e.who} rejected the API key. Check it in Settings.`;
   if (c === 'bad_model') return `${e.who} doesn't recognise that model name. Check the model in Settings.`;
   if (c === 'network') return `Could not reach ${e.who}. Check your internet connection and try again.`;
@@ -764,9 +765,9 @@ Fluency hint: ${words(String(r.response || '').replace(/\b(uh+|um+|ah+|er+|erm|h
 ${LEVELS}${calib}
 The test taker is aiming for CELPIP level ${target} or higher.
 TASK (${r.name}): ${r.taskText}
-RESPONSE (${r.wc} words):
+${withAudio ? `TEXT FROM SPEECH RECOGNITION (${r.wc} words; it may be empty or wrong because the device's speech recognition failed; the attached audio is the real answer)` : `RESPONSE (${r.wc} words)`}:
 """${r.response || '(no response)'}"""
-If the response is empty, extremely short or off-topic, give a low level (0-4).
+${withAudio ? 'Rate what you HEAR in the audio. Never give a low level just because the text above is empty or short. Give a low level (0-4) only if the audio itself has no speech, only a few words, or is off-topic.' : 'If the response is empty, extremely short or off-topic, give a low level (0-4).'}
 Reply with only JSON:
 {${withAudio ? '"transcript":"word-for-word transcript of the audio, including fillers",' : ''}"level":<integer 0-12 overall>,"dimensions":[${dims.map(d=>`{"name":"${d}","level":<0-12>,"comment":"1-2 sentences"}`).join(',')}],"summary":"2 sentences","strengths":["..."],"improvements":["specific and actionable, up to 4"],"corrections":[{"original":"exact words from the response","better":"corrected or more natural version","why":"short reason"}],"upgrades":["3 natural phrases or sentence patterns that would sound like level ${Math.min(12,target+1)}, using common words that Canadians really use, never rare or bookish vocabulary"],"model_answer":"a level 10-11 ${kind==='writing'?'response':'spoken response'} to the same task, ${modelLen}"}
 Give up to 8 corrections, most important first. In corrections, upgrades and model_answer, higher level means clearer, more precise and more natural everyday English, not rarer words: never suggest rare, literary or overly formal vocabulary.${withAudio ? ' Add up to 3 pronunciation tips to "improvements" if any words were unclear, naming the word and how to say it.' : ''}`;
@@ -774,6 +775,7 @@ Give up to 8 corrections, most important first. In corrections, upgrades and mod
 function score(r, kind){
   r.err = null;
   const clip = kind === 'speaking' && provider() === 'gemini' && S.ai.audioScoring !== false ? CLIPS.get(r) : null;
+  if (kind === 'speaking' && !String(r.response || '').trim() && !clip) { r.err = {code:'no_speech'}; r.scoring = Promise.resolve(); return r.scoring; }
   const prompt = scorePrompt(r, kind);
   const opts = {task: kind === 'writing' ? 'write' : 'speak'};
   if (clip) { opts.audio = clip; opts.audioPrompt = scorePrompt(r, kind, true); }
@@ -999,6 +1001,20 @@ async function recStart(){
     st.rec = new MediaRecorder(st.stream, type ? {mimeType:type, audioBitsPerSecond:32000} : {audioBitsPerSecond:32000});
     st.rec.ondataavailable = e => { if (e.data && e.data.size) st.chunks.push(e.data); };
     st.rec.start(1000);
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      st.ac = new AC(); const an = st.ac.createAnalyser(); an.fftSize = 512;
+      st.ac.createMediaStreamSource(st.stream).connect(an);
+      const buf = new Uint8Array(an.fftSize);
+      const tick = () => {
+        if (recState !== st) return;
+        an.getByteTimeDomainData(buf); let peak = 0; for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+        if (peak > 12) st.heard = true;
+        const bar = $('#vu i'); if (bar) bar.style.width = Math.min(100, peak / 64 * 100) + '%';
+        requestAnimationFrame(tick);
+      };
+      tick();
+    } catch(e) {}
   } catch(e) { console.warn('Recording not available', e); if (st.stream) st.stream.getTracks().forEach(t => t.stop()); if (recState === st) recState = null; }
 }
 function recStop(){
@@ -1006,6 +1022,7 @@ function recStop(){
   if (!st) return Promise.resolve(null);
   return new Promise(res => {
     const done = () => {
+      try { st.ac && st.ac.close(); } catch(e) {}
       if (st.stream) st.stream.getTracks().forEach(t => t.stop());
       if (!st.chunks.length) return res(null);
       const raw = (st.rec && st.rec.mimeType || st.chunks[0].type || 'audio/webm').split(';')[0];
@@ -1021,12 +1038,27 @@ function recStop(){
     else done();
   });
 }
-function recCancel(){ const st = recState; recState = null; if (st) { try { if (st.rec && st.rec.state !== 'inactive') st.rec.stop(); } catch(e) {} if (st.stream) st.stream.getTracks().forEach(t => t.stop()); } }
+function recCancel(){ const st = recState; recState = null; if (st) { try { st.ac && st.ac.close(); } catch(e) {} try { if (st.rec && st.rec.state !== 'inactive') st.rec.stop(); } catch(e) {} if (st.stream) st.stream.getTracks().forEach(t => t.stop()); } }
 
 /* browser speech recognition (downloaded version, Chrome / Edge / Safari) */
 const SR = !IN_ARTIFACT && (window.SpeechRecognition || window.webkitSpeechRecognition);
 let srRec = null, srWant = false;
-function micAvailable(){ return C.dict ? !S.dictOff : !!(SR && !S.srOff); }
+function micAvailable(){ return C.dict ? !S.dictOff : !!((SR && !S.srOff) || wantRecording()); }
+const IS_TOUCH = (() => { try { return matchMedia('(pointer: coarse)').matches || /Android|iPad|iPhone|iPod/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Mac/i.test(navigator.platform)); } catch(e) { return false; } })();
+const VU = '<span id="vu" style="display:inline-block;width:90px;height:8px;border-radius:4px;background:var(--line,#ddd);vertical-align:middle;margin-left:8px;overflow:hidden"><i style="display:block;height:100%;width:0;background:var(--accent,#2a7);transition:width .08s"></i></span>';
+/* record-only mode: the answer is transcribed by Gemini after the task */
+async function recOnlyToggle(btn){
+  if (recState && recState.rec) {
+    const r = recState.rec;
+    if (r.state === 'recording') { r.pause(); btn.classList.remove('on'); btn.textContent = '▶ Resume recording'; $('#partial').textContent = 'Paused.'; }
+    else if (r.state === 'paused') { r.resume(); btn.classList.add('on'); btn.textContent = '⏸ Pause recording'; $('#partial').innerHTML = 'Recording your voice' + VU; }
+    return;
+  }
+  await recStart();
+  if (!recState) { $('#partial').textContent = 'The microphone did not start. Allow microphone access for this site (lock icon next to the address), or type your answer.'; return; }
+  btn.classList.add('on'); btn.textContent = '⏸ Pause recording';
+  $('#partial').innerHTML = 'Recording your voice' + VU + '<br>Your words will be written out in the feedback after the task.';
+}
 function srSetBtn(on){ const b = $('#micbtn'); if (!b) return; b.classList.toggle('on', on); b.textContent = on ? '■ Stop microphone' : '🎙 Start microphone'; }
 function srStart(ta){
   srWant = true;
@@ -1642,7 +1674,7 @@ function renderSpeaking(task, p){
     const mic = micAvailable();
     return `<div class="spkans">
       ${mic ? '<button class="btn primary big mic" id="micbtn">🎙 Start microphone</button>' : ''}
-      <label for="spk" class="small muted">${mic ? 'Your words appear here as you talk. You can also type.' : 'Talk using your keyboard’s mic key (on a phone), or type what you would say.'}</label>
+      <label for="spk" class="small muted">${mic ? (!C.dict && (IS_TOUCH || !SR || S.srOff) && wantRecording() ? 'Your voice is recorded and written out in the feedback after the task. You can also type here.' : 'Your words appear here as you talk. You can also type.') : 'Talk using your keyboard’s mic key (on a phone), or type what you would say.'}</label>
       <textarea id="spk" style="min-height:160px" placeholder="${mic ? 'Tap Start microphone and talk…' : 'Tap the 🎙 key on your phone keyboard and talk…'}"></textarea>
       <div class="row between small"><span id="partial" class="muted"></span><span id="spkwc" class="muted">0 words</span></div>
     </div>`;
@@ -1666,7 +1698,11 @@ function renderSpeaking(task, p){
       ta.addEventListener('input', () => { $('#spkwc').textContent = words(ta.value) + ' words'; });
       const mb = $('#micbtn');
       if (mb) mb.onclick = () => {
-        if (!C.dict) { if (srWant) srStop(); else { recStart(); srStart(ta); } return; }
+        if (!C.dict) {
+          if ((IS_TOUCH || !SR || S.srOff) && wantRecording()) { recOnlyToggle(mb); return; }
+          if (srWant) srStop(); else { recStart().then(() => { const pv = $('#partial'); if (recState && pv && !pv.textContent) pv.innerHTML = 'Recording' + VU; }); srStart(ta); }
+          return;
+        }
         if (C.dict.active()) { C.dict.stop().catch(() => {}); return; }
         dictTarget = ta;
         C.dict.start().catch(e => {
@@ -1690,6 +1726,7 @@ function renderSpeaking(task, p){
     if (p.key === 'S5') { const mine = choice === 'B' ? task.B : task.A, other = choice === 'B' ? task.A : task.B; taskText += ` The test taker chose "${mine.name}" (${(mine.details||[]).join('; ')}) over "${other.name}" (${(other.details||[]).join('; ')}).`; }
     const r = {type:'task', kind:'speaking', key:p.key, name:p.name, taskText, response:text, wc:words(text), secs:p.speak};
     if (clip) CLIPS.set(r, clip);
+    if (!text && !clip) { r.err = {code:'no_speech'}; finishPart(r); return; }
     score(r, 'speaking'); finishPart(r);
   }
   draw();

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://www.gstatic.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://*.googleusercontent.com; media-src 'self' data: blob:; connect-src 'self' https://*.googleapis.com https://api.anthropic.com https://*.firebaseapp.com; frame-src https://celpip-prep-3a239.firebaseapp.com https://accounts.google.com; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"><meta name="referrer" content="strict-origin-when-cross-origin"><meta name="robots" content="noindex,nofollow"></head><body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://www.gstatic.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' data: blob:; connect-src 'self' https://*.googleapis.com https://api.openverse.org https://commons.wikimedia.org https://*.wikimedia.org https://api.anthropic.com https://*.firebaseapp.com; frame-src https://celpip-prep-3a239.firebaseapp.com https://accounts.google.com; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"><meta name="referrer" content="strict-origin-when-cross-origin"><meta name="robots" content="noindex,nofollow"></head><body>
 <title>Twelve Prep</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;500;600&family=Fira+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap">
@@ -122,6 +122,7 @@ textarea{width:100%;min-height:280px;font:inherit;line-height:1.6;padding:14px;b
 .mic{width:100%}
 .mic.on{background:var(--bad);border-color:var(--bad);color:#fff}
 .scene{width:100%;border-radius:8px;border:1px solid var(--line);background:#fff}
+.photo{margin:0}.photo .scene{display:block;max-height:62vh;object-fit:contain;background:var(--surface)}.photo figcaption{margin-top:4px;overflow-wrap:anywhere}
 .optcard{font:inherit;text-align:left;color:var(--ink);background:var(--surface);border:2px solid var(--line);border-radius:10px;padding:14px;cursor:pointer;display:flex;flex-direction:column;gap:6px;width:100%}
 .optcard[aria-pressed="true"]{border-color:var(--accent);background:var(--accent-soft)}
 .optcard ul{margin:0;padding-left:18px}
@@ -528,6 +529,11 @@ async function askRaw(prompt, json, opts){
   if (!p) throw {code:'no_provider'};
   if (p === 'claude-account') {
     const tier = opts.task === 'write' || opts.task === 'speak' ? 'complex' : 'default';
+    if (opts.image) {
+      let lim = null; try { lim = C.sample.limits && await C.sample.limits(); } catch(e) {}
+      if (!lim || !lim.images) throw {code:'no_image'};
+      return C.sample.json(prompt, {modelTier:tier, cache:false, images:[opts.image.blob]});
+    }
     return json ? C.sample.json(prompt, {modelTier:tier, cache:false}) : (await C.sample(prompt, {modelTier:tier, cache:false})).text;
   }
   if (p === 'gemini') {
@@ -536,7 +542,7 @@ async function askRaw(prompt, json, opts){
     let lastErr;
     for (let i = 0; i < chain.length; i++) {
       const m = chain[i], special = i < chain.length - 1;   /* one quick try each; only the last one waits out a per-minute limit */
-      const audio = opts.audio && canHear(m) ? opts.audio : null;
+      const audio = opts.audio && canHear(m) ? opts.audio : opts.image || null;
       const text0 = audio && opts.audioPrompt ? opts.audioPrompt : prompt;
       try {
         /* specialist models get one quick try (no waiting); the main model gets the patient retry */
@@ -556,7 +562,7 @@ async function askRaw(prompt, json, opts){
     }
     throw lastErr;
   }
-  const call = () => callAnthropic(prompt);
+  const call = () => callAnthropic(prompt, opts.image);
   let text = await call();
   if (!json) return text;
   let v = parseLoose(text);
@@ -648,13 +654,13 @@ async function callGemini(prompt, json, model, audio){
   if (!text) throw {code: (d.promptFeedback && d.promptFeedback.blockReason) || /SAFETY|PROHIBITED|BLOCK|RECITATION/.test(fin) ? 'refused' : 'empty_completion', who:'Gemini', detail: fin ? 'finishReason: ' + fin : ''};
   return text;
 }
-async function callAnthropic(prompt){
+async function callAnthropic(prompt, image){
   let res;
   try {
     res = await fetch('https://api.anthropic.com/v1/messages', {
       method:'POST',
       headers:{'content-type':'application/json', 'x-api-key':S.ai.anthropicKey.trim(), 'anthropic-version':'2026-10-21', 'anthropic-dangerous-direct-browser-access':'true'},
-      body:JSON.stringify({model:(S.ai.anthropicModel || AI_DEFAULTS.anthropicModel).trim(), max_tokens:16000, messages:[{role:'user', content:prompt}]})
+      body:JSON.stringify({model:(S.ai.anthropicModel || AI_DEFAULTS.anthropicModel).trim(), max_tokens:16000, messages:[{role:'user', content: image ? [{type:'image', source:{type:'base64', media_type:image.mime, data:image.data}}, {type:'text', text:prompt}] : prompt}]})
     });
   } catch(e) { throw {code:'network', who:'Claude'}; }
   if (!res.ok) throw await httpErr(res, 'Claude');
@@ -740,15 +746,22 @@ Create a complete CELPIP Speaking test (8 tasks) with fresh, varied situations. 
 Reply with only JSON:
 {"t1":{"prompt":"Task 1 Giving Advice: 2-3 sentences describing a friend or family member's situation, ending with what advice to give."},
 "t2":{"prompt":"Task 2: ask the test taker to talk about a specific personal experience (e.g. a time you ...). Include 2-3 guiding questions."},
-"scene":{"description":"An everyday scene for Tasks 3 and 4 (a park, a kitchen, a street fair, an office, a campsite...) with 7-10 distinct people and objects doing things, and where each is (left, centre, right, background). One or two details should suggest what will happen next."},
+"scene":{"search":"2-4 plain English words to find a real photo of a busy everyday scene with several people doing different things, e.g. farmers market crowd, family picnic park, busy restaurant kitchen, beach volleyball, airport check-in, street festival, children playground, camping site","description":"One sentence: the kind of scene those words should find."},
 "t5":{"situation":"Task 5: 1-2 sentences, e.g. Your family is choosing between two ... ","optionA":{"name":"...","details":["3-4 short facts: price, size, location, feature"]},"optionB":{"name":"...","details":["..."]},"persuade":"One sentence: who prefers the other option, and that you must persuade them your choice is better."},
 "t6":{"situation":"Task 6: a difficult situation of 3-4 sentences where you must choose between two people or two actions.","optionA":"Option A: ...","optionB":"Option B: ...","instruction":"Pick one of the two options and say what you would tell that person."},
 "t7":{"context":"1-2 sentences of background on a public issue","question":"An opinion question, e.g. Should ...? Explain your reasons."},
-"unusual":{"description":"An unusual object or odd situation for Task 8 (e.g. a sofa shaped like a giant shoe, a bicycle with a table built in), described visually in detail: colours, shape, size, parts.","prompt":"Task 8: You are talking on the phone with someone (say who and why it matters). Describe this unusual item in detail so they understand it, and explain..."}}`;
+"unusual":{"search":"2-4 plain English words to find a real photo of one strange but real object, vehicle or building, e.g. shoe shaped house, giant teapot building, upside down house, art car, tandem bicycle, novelty building, giant chair sculpture","description":"One sentence: the kind of thing those words should find.","prompt":"Task 8: You are talking on the phone with someone (say who and why it matters). Describe the unusual item in the picture in detail so they understand it, and explain... Do not say what the item is."}}`;
 }
-function svgPrompt(desc){
-  return `Draw a clear, friendly flat illustration as SVG, used as the picture in an English speaking test. Picture contents: ${desc}
-Rules: one <svg> element with xmlns="http://www.w3.org/2000/svg" and viewBox="0 0 640 400"; a full background; only rect, circle, ellipse, path, polygon, polyline, line and g elements with solid fills; simple but recognisable people (head, body, arms, legs) and objects arranged as described; no text, no <script>, no <image>, no foreignObject, no external references. Keep it under 10000 characters. Reply with only the SVG markup.`;
+function photoPrompt(which){
+  if (which === 'unusual') return `This photo may be used as the picture for Task 8 of an English speaking practice test, where the test taker describes an unusual item to someone on the phone. Look at it carefully.
+Reply with only JSON: {"usable":true,"description":"...","prompt":"..."}
+usable: true only if it is a clear, real photo where one strange or surprising object, vehicle or building is the main subject and easy to see; false if it is blurry, an old black-and-white or sepia photo, a product shot on a plain background, mostly text, a map or diagram, crowded with other things, or shows anything violent, sexual or upsetting.
+description: 70-120 words in plain English: what the item looks like (shape, size, colours, materials, parts) and where it is.
+prompt: the task, 2-3 sentences: "You are talking on the phone with ..." (say who and why the item matters to them), ask the test taker to describe the item in detail and explain one thing about it (e.g. why they think the other person should or should not buy or visit it). Do not name the item.`;
+  return `This photo may be used as the picture for an English speaking practice test, where the test taker describes the scene and then says what will probably happen next. Look at it carefully.
+Reply with only JSON: {"usable":true,"description":"..."}
+usable: true only if it is a clear, real photo of an everyday scene with at least three people or several objects in action that are easy to see; false if it is blurry, an old black-and-white or sepia photo, mostly text, a map, diagram, animal close-up or close-up portrait, nearly empty, or shows anything violent, sexual or upsetting.
+description: 90-150 words in plain English: who and what is where (left, centre, right, foreground, background), what people are doing, and one or two details that suggest what may happen next.`;
 }
 
 /* ---------- generation ---------- */
@@ -782,8 +795,8 @@ async function genPart(section, p, run){
   // speaking
   const set = await speakingSet(run);
   let img = null;
-  if (p.key === 'S3' || p.key === 'S4') img = await speakingSvg(run, 'scene', set.scene && set.scene.description).catch(() => null);
-  if (p.key === 'S8') img = await speakingSvg(run, 'unusual', set.unusual && set.unusual.description).catch(() => null);
+  if (p.key === 'S3' || p.key === 'S4') img = await speakingPhoto(run, 'scene', set.scene).catch(e => { console.warn('No photo for the scene', e); return null; });
+  if (p.key === 'S8') img = await speakingPhoto(run, 'unusual', set.unusual).catch(e => { console.warn('No photo for the item', e); return null; });
   return buildSpeakingTask(p.key, set, img);
 }
 function speakingSet(run){
@@ -793,15 +806,72 @@ function speakingSet(run){
   }
   return run.cache.set;
 }
-function speakingSvg(run, which, desc){
-  const k = 'svg_' + which;
+/* real photos for Tasks 3, 4 and 8: openly licensed photos from Openverse (Flickr and others) or Wikimedia Commons.
+   The AI looks at the photo it picked and writes what it shows, so the rating matches the real picture. */
+const PHOTO_SEEN = 'tp-photos-seen';
+const stripTags = t => String(t || '').replace(/<[^>]*>/g, ' ').replace(/&[a-z#0-9]+;/gi, ' ').replace(/\s+/g, ' ').trim();
+async function findPhotos(q){
+  const out = [];
+  const ov = (async () => {
+    const r = await fetch('https://api.openverse.org/v1/images/?q=' + encodeURIComponent(q) + '&category=photograph&aspect_ratio=wide&mature=false&page_size=20');
+    if (r.ok) for (const x of ((await r.json()).results || [])) {
+      if (!x.id || !x.url || (x.width && x.width < 640)) continue;
+      out.push({id:'ov:' + x.id, src:x.url, thumb:'https://api.openverse.org/v1/images/' + x.id + '/thumb/', title:stripTags(x.title), by:stripTags(x.creator),
+        lic:x.license ? (x.license === 'cc0' || x.license === 'pdm' ? x.license.toUpperCase() : 'CC ' + x.license.toUpperCase() + ' ' + (x.license_version || '')).trim() : '', link:x.foreign_landing_url || '', words:((x.title || '') + ' ' + (x.tags || []).map(t => t.name).join(' ')).toLowerCase()});
+    }
+  })().catch(e => console.warn('Openverse search failed', e));
+  const wc = (async () => {
+    const r = await fetch('https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrnamespace=6&gsrlimit=20&gsrsearch='
+      + encodeURIComponent(q + ' filetype:bitmap') + '&prop=imageinfo&iiprop=url|size|mime|extmetadata&iiurlwidth=1280');
+    if (r.ok) for (const pg of Object.values(((await r.json()).query || {}).pages || {})) {
+      const ii = (pg.imageinfo || [])[0]; if (!ii || ii.mime !== 'image/jpeg' || ii.width < 800 || ii.width < ii.height * 1.15) continue;
+      const md = ii.extmetadata || {}, v = k => stripTags(md[k] && md[k].value);
+      out.push({id:'wc:' + pg.pageid, src:ii.thumburl || ii.url, thumb:ii.thumburl || ii.url, title:v('ObjectName') || String(pg.title || '').replace(/^File:|\.\w+$/g, ''),
+        by:v('Artist'), lic:v('LicenseShortName'), link:ii.descriptionurl || '', words:(pg.title + ' ' + v('ImageDescription') + ' ' + v('Categories')).toLowerCase()});
+    }
+  })().catch(e => console.warn('Wikimedia search failed', e));
+  await Promise.all([ov, wc]);
+  /* best matches first: how many of the search words appear in the title, tags or description */
+  const qw = q.toLowerCase().split(/[^a-z]+/).filter(w => w.length > 2).map(w => w.replace(/(es|s)$/, ''));
+  out.forEach((x, i) => { x.score = qw.filter(w => x.words.includes(w)).length - i * 0.01; });
+  return out.sort((a, b) => b.score - a.score);
+}
+async function photoData(url){
+  const r = await fetch(url); if (!r.ok) throw new Error('photo ' + r.status);
+  const blob = await r.blob(); if (!/^image\//.test(blob.type) || blob.size < 8000) throw new Error('not a photo');
+  const data = await new Promise((res, rej) => { const f = new FileReader(); f.onload = () => res(String(f.result).split(',')[1]); f.onerror = rej; f.readAsDataURL(blob); });
+  return {blob, data, mime:blob.type};
+}
+function speakingPhoto(run, which, info){
+  const k = 'photo_' + which;
   if (!run.cache[k]) {
-    run.cache[k] = askText(svgPrompt(desc || 'a busy park on a sunny day'), {task:'gen'}).then(t => {
-      const m = t.match(/<svg[\s\S]*<\/svg>/i); if (!m) throw {code:'bad_content'};
-      let svg = m[0].replace(/<script[\s\S]*?<\/script>/gi,'').replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi,'').replace(/\son\w+\s*=\s*("[^"]*"|'[^']*')/gi,'');
-      if (!/xmlns=/.test(svg)) svg = svg.replace(/<svg/i, '<svg xmlns="http://www.w3.org/2000/svg"');
-      return URL.createObjectURL(new Blob([svg], {type:'image/svg+xml'}));
-    });
+    run.cache[k] = (async () => {
+      info = info || {};
+      const fallback = which === 'unusual' ? 'novelty building' : 'busy park people';
+      let seen = []; try { seen = JSON.parse(localStorage.getItem(PHOTO_SEEN) || '[]'); } catch(e) {}
+      let list = await findPhotos(String(info.search || info.description || fallback).slice(0, 80));
+      if (list.length < 3) list = list.concat(await findPhotos(fallback));
+      if (!list.length) throw {code:'no_photo'};
+      /* prefer photos not shown before, then shuffle the best matches */
+      const fresh = list.filter(x => !seen.includes(x.id)), cand = fresh.length ? fresh : list;
+      const top = Math.floor(cand[0].score), pool = cand.filter(x => x.score > top - 1).slice(0, 10), rest = cand.filter(x => !pool.includes(x));
+      for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+      pool.push(...rest);
+      let lastErr = {code:'no_photo'};
+      for (const ph of pool.slice(0, 4)) {
+        try {
+          const img = await photoData(ph.thumb);
+          const v = await askJSON(photoPrompt(which), {task:'gen', image:img});
+          if (!v || !v.usable || !v.description) { lastErr = {code:'bad_photo'}; continue; }
+          try { localStorage.setItem(PHOTO_SEEN, JSON.stringify([ph.id, ...seen].slice(0, 300))); } catch(e) {}
+          return {...ph, local:URL.createObjectURL(img.blob), description:String(v.description), prompt:v.prompt ? String(v.prompt) : ''};
+        } catch(e) {
+          lastErr = e;
+          if (['bad_key','no_provider','no_sample','no_image'].includes(e && e.code)) break;
+        }
+      }
+      throw lastErr;
+    })();
     run.cache[k].catch(() => { run.cache[k] = null; });
   }
   return run.cache[k];
@@ -811,12 +881,12 @@ function buildSpeakingTask(key, s, img){
   switch (key) {
     case 'S1': return {prompt:g(s.t1,'prompt'), taskText:g(s.t1,'prompt')};
     case 'S2': return {prompt:g(s.t2,'prompt'), taskText:g(s.t2,'prompt')};
-    case 'S3': { const t='Describe what is going on in this picture in as much detail as you can. Imagine you are talking to someone who cannot see it.'; return {prompt:t, img, desc:g(s.scene,'description'), taskText:t+' [Picture contents: '+g(s.scene,'description')+']'}; }
-    case 'S4': { const t='Look at this picture. What do you think is likely to happen next, and why?'; return {prompt:t, img, desc:g(s.scene,'description'), taskText:t+' [Picture contents: '+g(s.scene,'description')+']'}; }
+    case 'S3': { const t='Describe what is going on in this picture in as much detail as you can. Imagine you are talking to someone who cannot see it.', d = img ? img.description : g(s.scene,'description'); return {prompt:t, img, desc:d, taskText:t+' [Picture contents: '+d+']'}; }
+    case 'S4': { const t='Look at this picture. What do you think is likely to happen next, and why?', d = img ? img.description : g(s.scene,'description'); return {prompt:t, img, desc:d, taskText:t+' [Picture contents: '+d+']'}; }
     case 'S5': return {situation:g(s.t5,'situation'), A:(s.t5&&s.t5.optionA)||{}, B:(s.t5&&s.t5.optionB)||{}, persuade:g(s.t5,'persuade'), taskText:g(s.t5,'situation')+' '+g(s.t5,'persuade')};
     case 'S6': { const t5=s.t6||{}; return {prompt:g(t5,'situation'), options:[g(t5,'optionA'), g(t5,'optionB')], extra:g(t5,'instruction'), taskText:[g(t5,'situation'), g(t5,'optionA'), g(t5,'optionB'), g(t5,'instruction')].join(' ')}; }
     case 'S7': return {prompt:g(s.t7,'context'), extra:g(s.t7,'question'), taskText:g(s.t7,'context')+' '+g(s.t7,'question')};
-    case 'S8': return {prompt:g(s.unusual,'prompt'), img, desc:g(s.unusual,'description'), taskText:g(s.unusual,'prompt')+' [Picture contents: '+g(s.unusual,'description')+']'};
+    case 'S8': { const t = (img && img.prompt) || g(s.unusual,'prompt'), d = img ? img.description : g(s.unusual,'description'); return {prompt:t, img, desc:d, taskText:t+' [Picture contents: '+d+']'}; }
   }
 }
 
@@ -1889,7 +1959,16 @@ function renderWriting(data, p){
 function renderSpeaking(task, p){
   const run = S.run, mock = run.mode === 'mock';
   let phase = p.choose ? 'choose' : 'prep', choice = null, finished = false;
-  const imgHTML = () => task.img ? `<img class="scene" src="${task.img}" alt="Picture for this task">` : task.desc ? `<div class="note small"><b>Picture:</b> the drawing couldn't be made, so here is what it shows. ${esc(task.desc)}</div>` : '';
+  const imgHTML = () => {
+    const im = task.img;
+    if (im && typeof im === 'object') {
+      const credit = [im.title ? '“' + im.title.slice(0, 80) + '”' : '', im.by ? 'by ' + im.by.slice(0, 60) : '', im.lic].filter(Boolean).join(' ');
+      return `<figure class="photo"><img class="scene" src="${esc(im.src)}" data-local="${esc(im.local)}" alt="Picture for this task" referrerpolicy="no-referrer" onerror="if(this.dataset.local&&this.src!==this.dataset.local){this.src=this.dataset.local}">`
+        + `<figcaption class="small muted">Photo${credit ? ': ' + esc(credit) : ''}${im.link ? ` · <a href="${esc(im.link)}" target="_blank" rel="noopener noreferrer">source</a>` : ''}</figcaption></figure>`;
+    }
+    if (im) return `<img class="scene" src="${im}" alt="Picture for this task">`;
+    return task.desc ? `<div class="note small"><b>Picture:</b> no photo could be loaded, so here is what it shows. ${esc(task.desc)}</div>` : '';
+  };
   const details = o => `<ul class="small">${(o.details||[]).map(d => `<li>${esc(d)}</li>`).join('')}</ul>`;
   const optCard = (o, k) => `<button class="optcard" data-choose="${k}" aria-pressed="${choice===k}" ${phase!=='choose'?'disabled':''}><b>${esc(o.name || 'Option '+k)}</b>${details(o)}</button>`;
   function promptHTML(){

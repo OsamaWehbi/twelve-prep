@@ -249,7 +249,25 @@ const SECTIONS = {
     {key:'S8',name:'Task 8 · Describing an Unusual Situation',prep:30,speak:60}
   ]}
 };
-const TOPICS = ["renting an apartment with a broken appliance","registering children for a community centre summer camp","returning an online order","planning a surprise party","a new city compost and recycling program","booking an appointment at a walk-in clinic","choosing a cell phone plan","winter driving and snow tires","volunteering at a food bank","a workplace moving to a hybrid schedule","new services at the public library","a neighbourhood dispute over parking","signing up for a fitness class","a cancelled flight and rebooking","adopting a pet from a shelter","starting a community garden","a school fundraiser","a car repair estimate","applying for a part-time job","a city plan to add bike lanes","moving to a new city in Canada","a lost item at a transit station","organising a company picnic","a kitchen renovation","a farmers' market","a power outage during a storm","an evening course at a college","a local summer festival","a noisy upstairs neighbour","choosing a daycare","a hiking trip in a provincial park","buying a used car","a problem with a bank account","renewing a lease with a landlord","a new restaurant opening","an adult recreational hockey league","home office equipment for remote work","rescheduling a dentist appointment","reserving a campsite","a museum membership","a condo board meeting","a youth soccer coach shortage","a hospital volunteer program","a grocery store loyalty program","a carpool to work","a wedding with too many guests","a broken furnace in January","a neighbourhood safety watch","learning to skate as an adult","downsizing to a smaller home"];
+const TOPICS = ["renting an apartment with a broken appliance","registering children for a community centre summer camp","returning an online order","planning a surprise party","a new city compost and recycling program","booking an appointment at a walk-in clinic","choosing a cell phone plan","winter driving and snow tires","volunteering at a food bank","a workplace moving to a hybrid schedule","new services at the public library","a neighbourhood dispute over parking","signing up for a fitness class","a cancelled flight and rebooking","adopting a pet from a shelter","starting a community garden","a school fundraiser","a car repair estimate","applying for a part-time job","a city plan to add bike lanes","moving to a new city in Canada","a lost item at a transit station","organising a company picnic","a kitchen renovation","a farmers' market","a power outage during a storm","an evening course at a college","a local summer festival","a noisy upstairs neighbour","choosing a daycare","a hiking trip in a provincial park","buying a used car","a problem with a bank account","renewing a lease with a landlord","a new restaurant opening","an adult recreational hockey league","home office equipment for remote work","rescheduling a dentist appointment","reserving a campsite","a museum membership","a condo board meeting","a youth soccer coach shortage","a hospital volunteer program","a grocery store loyalty program","a carpool to work","a wedding with too many guests","a broken furnace in January","a neighbourhood safety watch","learning to skate as an adult","downsizing to a smaller home","a delayed furniture delivery","a coworker's retirement party","a city plan for a new dog park","a broken laptop under warranty","a road trip across the prairies","a mix-up with a hotel booking","joining a book club","a new rule about e-scooters downtown","a child's first day at a new school","a roommate who never cleans","a charity run for a local hospital","a leaking roof after heavy rain","a job interview over video","an online course certificate","choosing between two job offers","a neighbour's tree falling on a fence","a community theatre play","a lost wallet on a bus","a tax return question","a flat tire on the highway","taking care of an elderly parent","a new public swimming pool schedule","a cooking class with a friend","a ski trip in the mountains","a misdelivered parcel","a noisy construction site near home","a work team that misses deadlines","a gym that changed its fees","a babysitter cancelling last minute","a birthday gift that arrived broken","planning a family reunion","a library late fee dispute","a farmer's stand closing for the season","a power bill that is too high","an apartment with no parking spot","a school plan to ban phones in class","a long wait at a passport office","a canoe trip on a lake","moving an office to a new building","a new bus route in the suburbs","a phone screen repair","a sports team needing new uniforms","a friend borrowing money","a dentist recommending braces","a holiday market in December","starting a small online business","a neighbourhood clean-up day","an allergy at a restaurant"];
+/* topics come out in a shuffled order and none repeats until all have been used (kept per device) */
+const DECKKEY = 'tp-topic-deck', RECENTKEY = 'tp-recent';
+function nextTopic(){
+  let d = []; try { d = JSON.parse(localStorage.getItem(DECKKEY) || '[]').filter(t => TOPICS.includes(t)); } catch(e) {}
+  if (!d.length) { d = TOPICS.slice(); for (let i = d.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [d[i], d[j]] = [d[j], d[i]]; } }
+  const t = d.shift(); try { localStorage.setItem(DECKKEY, JSON.stringify(d)); } catch(e) {}
+  return t;
+}
+function recentOf(kind){ try { return (JSON.parse(localStorage.getItem(RECENTKEY) || '{}')[kind]) || []; } catch(e) { return []; } }
+function remember(kind, items){
+  items = (Array.isArray(items) ? items : [items]).map(x => String(x || '').replace(/\s+/g, ' ').trim().slice(0, 110)).filter(Boolean);
+  if (!items.length) return;
+  try { const all = JSON.parse(localStorage.getItem(RECENTKEY) || '{}'); all[kind] = [...items, ...(all[kind] || [])].slice(0, 24); localStorage.setItem(RECENTKEY, JSON.stringify(all)); } catch(e) {}
+}
+function avoidRecent(kind){
+  const r = recentOf(kind);
+  return r.length ? `\nThese situations were used in this person's recent practice tests. Do NOT repeat or closely resemble any of them (choose a different setting, different people and a different problem):\n- ${r.join('\n- ')}` : '';
+}
 const L_TABLE = [[37,12],[35,11],[33,10],[31,9],[28,8],[24,7],[19,6],[15,5],[11,4],[7,3]];
 const R_TABLE = [[37,12],[35,11],[33,10],[30,9],[27,8],[23,7],[18,6],[14,5],[10,4],[7,3]];
 
@@ -709,7 +727,7 @@ function listeningPrompt(p){
   return `${GEN}
 Create CELPIP Listening ${p.name}.
 Format: ${p.desc}
-Topic idea (adapt freely): ${pick(TOPICS)}. Variation code: ${rnd()}.
+Topic idea (adapt freely): ${nextTopic()}.${avoidRecent('L:' + p.key)}
 ${segs.length > 1 ? `Return ${segs.length} segments (the conversation continues across them). Questions per segment: ${segs.join(', ')}.` : `Return 1 segment with ${segs[0]} questions.`}
 Script: natural spoken English with contractions, ${p.words} words in total across all segments. ${p.speakers} Each script line is one speaker turn. Give each speaker a first name and a gender ("female" or "male").
 Questions: mix detail, inference, purpose and speaker-attitude questions. They must not be answerable without listening. ${MC_RULES}
@@ -725,32 +743,87 @@ const READ_FORMAT = {
 function readingPrompt(p){
   return `${GEN}
 Create CELPIP Reading ${READ_FORMAT[p.key]}
-Topic idea (adapt freely): ${pick(TOPICS)}. Variation code: ${rnd()}.
+Topic idea (adapt freely): ${nextTopic()}.${avoidRecent('R:' + p.key)}
 Separate paragraphs inside a passage with \\n\\n. ${MC_RULES} (Part 3 uses 5 options as described.)
 Reply with only JSON:
 {"title":"short title","passages":[{"heading":"...","text":"..."}],"diagram":null,"questions":[{"blank":null,"q":"...","options":["...","...","...","..."],"answer":0,"explanation":"short reason pointing to the text"}]}`;
 }
 function writingPrompt(p){
   if (p.key === 'W1') return `${GEN}
-Create a CELPIP Writing Task 1 (Writing an Email) prompt. Topic idea: ${pick(TOPICS)}. Variation code: ${rnd()}.
+Create a CELPIP Writing Task 1 (Writing an Email) prompt. Topic idea: ${nextTopic()}.${avoidRecent('W1')}
 Give a realistic situation (2-3 sentences) and exactly 3 bullet points the email must cover (for example: describe what happened, explain how it affected you, say what you want done). The recipient may be formal (a company, manager, landlord) or informal (a friend).
 Reply with only JSON: {"title":"short title","situation":"...","bullets":["...","...","..."]}`;
   return `${GEN}
-Create a CELPIP Writing Task 2 (Responding to Survey Questions) prompt. Topic idea: ${pick(TOPICS)}. Variation code: ${rnd()}.
+Create a CELPIP Writing Task 2 (Responding to Survey Questions) prompt. Topic idea: ${nextTopic()}.${avoidRecent('W2')}
 Give a short context (2-3 sentences) about a community, workplace or city decision, then two realistic options that both have clear pros and cons.
 Reply with only JSON: {"title":"short title","context":"...","optionA":"...","optionB":"..."}`;
 }
 function speakingPrompt(){
   return `${GEN}
-Create a complete CELPIP Speaking test (8 tasks) with fresh, varied situations. Variation code: ${rnd()}. Topic ideas: ${pick(TOPICS)}; ${pick(TOPICS)}; ${pick(TOPICS)}.
+Create a complete CELPIP Speaking test (8 tasks) with fresh, varied situations.
+Every task must have a different setting, different people and a different problem: no two tasks may share a theme (for example not two about neighbours, pets, moving or work). Topic ideas, one per task, adapt freely: Task 1: ${nextTopic()}; Task 2: ${nextTopic()}; Tasks 3-4 scene: ${nextTopic()}; Task 5: ${nextTopic()}; Task 6: ${nextTopic()}; Task 7: ${nextTopic()}.${avoidRecent('S')}
 Reply with only JSON:
 {"t1":{"prompt":"Task 1 Giving Advice: 2-3 sentences describing a friend or family member's situation, ending with what advice to give."},
 "t2":{"prompt":"Task 2: ask the test taker to talk about a specific personal experience (e.g. a time you ...). Include 2-3 guiding questions."},
-"scene":{"search":"2-4 plain English words to find a real photo of a busy everyday scene with several people doing different things, e.g. farmers market crowd, family picnic park, busy restaurant kitchen, beach volleyball, airport check-in, street festival, children playground, camping site","description":"One sentence: the kind of scene those words should find."},
+"scene":{"description":"The picture for Tasks 3 and 4, to be drawn as a cartoon: ONE everyday scene (max 60 words) with 5-6 clearly separate people or groups, each doing one simple, easy-to-draw action, each with its place (left, centre, right, foreground, background), plus one visible detail that suggests what will happen next (e.g. dark clouds, a ball rolling toward the road, a dog pulling at a leash).","search":"2-4 plain English words to find a real photo of a similar scene, as a backup"},
 "t5":{"situation":"Task 5: 1-2 sentences, e.g. Your family is choosing between two ... ","optionA":{"name":"...","details":["3-4 short facts: price, size, location, feature"]},"optionB":{"name":"...","details":["..."]},"persuade":"One sentence: who prefers the other option, and that you must persuade them your choice is better."},
 "t6":{"situation":"Task 6: a difficult situation of 3-4 sentences where you must choose between two people or two actions.","optionA":"Option A: ...","optionB":"Option B: ...","instruction":"Pick one of the two options and say what you would tell that person."},
 "t7":{"context":"1-2 sentences of background on a public issue","question":"An opinion question, e.g. Should ...? Explain your reasons."},
-"unusual":{"search":"2-4 plain English words to find a real photo of one strange but real object, vehicle or building, e.g. shoe shaped house, giant teapot building, upside down house, art car, tandem bicycle, novelty building, giant chair sculpture","description":"One sentence: the kind of thing those words should find.","prompt":"Task 8: You are talking on the phone with someone (say who and why it matters). Describe the unusual item in the picture in detail so they understand it, and explain... Do not say what the item is."}}`;
+"unusual":{"description":"The picture for Task 8, to be drawn as a cartoon: ONE strange imaginary object (max 40 words) such as a sofa shaped like a giant shoe or a bicycle with an umbrella roof: its shape, colours, size and 2-3 parts, shown alone on a simple background.","search":"2-4 plain English words to find a real photo of a strange object, as a backup","prompt":"Task 8: You are talking on the phone with someone (say who and why it matters). Describe the unusual item in the picture in detail so they understand it, and explain... Do not say what the item is."}}`;
+}
+function artCheckPrompt(which){
+  const what = which === 'unusual'
+    ? `Task 8, where the test taker describes an unusual item to someone on the phone. usable: true only if one strange object is clearly the main subject and easy to recognise.
+description: 60-100 words in plain English: what the item looks like (shape, size, colours, materials, parts) and where it is.
+prompt: the task, 2-3 sentences: "You are talking on the phone with ..." (say who and why the item matters to them); ask the test taker to describe the item in detail and explain one thing about it (e.g. why the other person should or should not buy it). Do not name the item.
+Reply with only JSON: {"usable":true,"description":"...","prompt":"..."}`
+    : `Tasks 3 and 4, where the test taker describes the scene and then says what will probably happen next. usable: true only if it shows a clear everyday scene with at least three people doing things that are easy to recognise.
+description: 90-140 words in plain English: who and what is where (left, centre, right, foreground, background), what people are doing, and one or two details that suggest what may happen next. Describe only what is really in the picture.
+Reply with only JSON: {"usable":true,"description":"..."}`;
+  return `This cartoon picture may be used in an English speaking practice test, ${what}
+Set usable to false if the picture is mostly empty, confusing, has badly distorted or melted people or objects, contains readable text, or shows anything violent, sexual or upsetting.`;
+}
+/* colourful flat 2D cartoon pictures, like the real test: drawn by a Gemini image model if this key has a free one, otherwise taken from the app's own set of cartoon pictures (pics/) */
+const PICS = /*PICS*/[];
+const ART_STYLE = "Flat 2D cartoon illustration in bright, cheerful colours, clean bold outlines, simple shapes, friendly people with simple faces, picture-book style, daylight, no text, no letters, no words, no signs with writing";
+const G_IMG_MODELS = ['gemini-3.1-flash-image', 'gemini-2.5-flash-image'];
+async function blobPart(blob){
+  const data = await new Promise((res, rej) => { const f = new FileReader(); f.onload = () => res(String(f.result).split(',')[1]); f.onerror = rej; f.readAsDataURL(blob); });
+  return {blob, data, mime:blob.type || 'image/jpeg'};
+}
+async function libraryPicture(which){
+  const list = PICS.filter(x => which === 'unusual' ? x.id.startsWith('item') : x.id.startsWith('scene'));
+  if (!list.length) throw {code:'no_photo'};
+  let seen = []; try { seen = JSON.parse(localStorage.getItem(PHOTO_SEEN) || '[]'); } catch(e) {}
+  let pool = list.filter(x => !seen.includes('pic:' + x.id));
+  if (!pool.length) {   /* every picture was used: start again, oldest first */
+    pool = list.slice().sort((a, b) => seen.lastIndexOf('pic:' + b.id) - seen.lastIndexOf('pic:' + a.id)).slice(0, Math.max(1, Math.floor(list.length / 2)));
+  }
+  const x = pool[Math.floor(Math.random() * pool.length)];
+  const r = await fetch('pics/' + x.id + '.jpg'); if (!r.ok) throw {code:'no_photo'};
+  return {...(await blobPart(await r.blob())), maker:'set', id:'pic:' + x.id, hint:x.d};
+}
+async function drawPicture(desc, seed, which){
+  const text = (ART_STYLE + '. ' + desc).slice(0, 900);
+  if (provider() === 'gemini' && S.ai.drawPics === true) {   /* Gemini picture models are paid-only on most keys, so this is off unless turned on */
+    await loadModelList();
+    for (const want of G_IMG_MODELS) {
+      const m = resolveModel(want); if (!m || skipped(m)) continue;
+      try {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(m)}:generateContent`, {method:'POST',
+          headers:{'Content-Type':'application/json', 'x-goog-api-key':S.ai.geminiKey.trim()},
+          body:JSON.stringify({contents:[{role:'user', parts:[{text:text + '. Wide 16:9 picture.'}]}], generationConfig:{responseModalities:['TEXT','IMAGE']}})});
+        if (!res.ok) throw await httpErr(res, 'Gemini');
+        const j = await res.json();
+        const part = ((((j.candidates || [])[0] || {}).content || {}).parts || []).find(x => x.inlineData || x.inline_data);
+        const inl = part && (part.inlineData || part.inline_data);
+        if (!inl) throw {code:'empty_completion'};
+        const bin = atob(inl.data), u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        return {...(await blobPart(new Blob([u8], {type:inl.mimeType || inl.mime_type || 'image/png'}))), maker:'Gemini'};
+      } catch(e) { const ms = skipFor(e); if (ms) skipModel(m, ms); console.warn('Gemini picture model ' + m + ' not available (' + (e && e.code) + ')'); }
+    }
+  }
+  return libraryPicture(which);
 }
 function photoPrompt(which){
   if (which === 'unusual') return `This photo may be used as the picture for Task 8 of an English speaking practice test, where the test taker describes an unusual item to someone on the phone. Look at it carefully.
@@ -777,6 +850,7 @@ async function genPart(section, p, run){
       questions: (s.questions||[]).filter(q => validMC(q)).map(q => ({...q, answer:+q.answer}))
     })).filter(s => s.questions.length);
     if (!d.segments.length) throw {code:'bad_content'};
+    remember('L:' + p.key, d.title || (d.context || ''));
     return d;
   }
   if (section === 'reading') {
@@ -785,11 +859,13 @@ async function genPart(section, p, run){
     const n = p.key === 'R3' ? 5 : 4;
     d.questions = d.questions.filter(q => validMC(q, n)).map(q => ({...q, answer:+q.answer, blank: q.blank == null || q.blank === '' ? null : +q.blank}));
     if (!d.questions.length) throw {code:'bad_content'};
+    remember('R:' + p.key, d.title || ((d.passages || [])[0] || {}).heading);
     return d;
   }
   if (section === 'writing') {
     const d = await askJSON(writingPrompt(p), {task:'gen'});
     if (!d || (p.key === 'W1' ? !d.situation : !d.optionA)) throw {code:'bad_content'};
+    remember(p.key, (d.title ? d.title + ': ' : '') + (d.situation || d.context || ''));
     return d;
   }
   // speaking
@@ -801,7 +877,16 @@ async function genPart(section, p, run){
 }
 function speakingSet(run){
   if (!run.cache.set) {
-    run.cache.set = askJSON(speakingPrompt(), {task:'gen'}).then(s => { if (!s || !s.t1 || !s.t7) throw {code:'bad_content'}; return s; });
+    run.cache.set = askJSON(speakingPrompt(), {task:'gen'}).then(s => {
+      if (!s || !s.t1 || !s.t7) throw {code:'bad_content'};
+      const g = (o, f) => o && o[f] ? String(o[f]) : '';
+      remember('S', [g(s.t1,'prompt'), g(s.t2,'prompt'), g(s.scene,'description'), g(s.t5,'situation'), g(s.t6,'situation'), g(s.t7,'question'), g(s.unusual,'description')]);
+      /* start drawing the pictures now, so they are ready when Tasks 3, 4 and 8 come up */
+      const keys = (run.parts || []).map(x => x.key);
+      const wantScene = keys.some(k => k === 'S3' || k === 'S4'), wantItem = keys.includes('S8');
+      (wantScene ? speakingPhoto(run, 'scene', s.scene).catch(() => {}) : Promise.resolve()).then(() => { if (wantItem) speakingPhoto(run, 'unusual', s.unusual).catch(() => {}); });
+      return s;
+    });
     run.cache.set.catch(() => { run.cache.set = null; });
   }
   return run.cache.set;
@@ -847,9 +932,26 @@ function speakingPhoto(run, which, info){
   if (!run.cache[k]) {
     run.cache[k] = (async () => {
       info = info || {};
+      if (info.description && (S.ai.drawPics === true || PICS.length)) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const img = await drawPicture(info.description, Math.floor(Math.random() * 1e6), which);
+            let v;
+            try { v = await askJSON(artCheckPrompt(which), {task:'gen', image:img}); }
+            catch(e) { if (img.hint && e && e.code === 'no_image') v = {usable:true, description:img.hint}; else throw e; }   /* AI can't see pictures here: use the set's own description */
+            if (!v || !v.usable || !v.description) { console.warn('Drawn picture rejected, drawing again'); continue; }
+            const local = URL.createObjectURL(img.blob);
+            if (img.id) { try { const seen = JSON.parse(localStorage.getItem(PHOTO_SEEN) || '[]'); localStorage.setItem(PHOTO_SEEN, JSON.stringify([img.id, ...seen.filter(x => x !== img.id)].slice(0, 300))); } catch(e) {} }
+            return {id:'art', art:true, src:local, local, title:'', by:'', lic:'', link:'', maker:img.maker, description:String(v.description), prompt:v.prompt ? String(v.prompt) : ''};
+          } catch(e) {
+            console.warn('Could not draw the picture', e);
+            if (['bad_key','no_provider','no_sample','no_image'].includes(e && e.code)) throw e;
+          }
+        }
+      }
       const fallback = which === 'unusual' ? 'novelty building' : 'busy park people';
       let seen = []; try { seen = JSON.parse(localStorage.getItem(PHOTO_SEEN) || '[]'); } catch(e) {}
-      let list = await findPhotos(String(info.search || info.description || fallback).slice(0, 80));
+      let list = await findPhotos(String(info.search || fallback).slice(0, 80));
       if (list.length < 3) list = list.concat(await findPhotos(fallback));
       if (!list.length) throw {code:'no_photo'};
       /* prefer photos not shown before, then shuffle the best matches */
@@ -1976,13 +2078,14 @@ function renderSpeaking(task, p){
   let phase = p.choose ? 'choose' : 'prep', choice = null, finished = false;
   const imgHTML = () => {
     const im = task.img;
+    if (im && typeof im === 'object' && im.art) return `<figure class="photo"><img class="scene" src="${esc(im.src)}" alt="Picture for this task"><figcaption class="small muted">Picture drawn by AI${im.maker === 'set' ? ' (Pollinations.ai)' : ''}</figcaption></figure>`;
     if (im && typeof im === 'object') {
       const credit = [im.title ? '“' + im.title.slice(0, 80) + '”' : '', im.by ? 'by ' + im.by.slice(0, 60) : '', im.lic].filter(Boolean).join(' ');
       return `<figure class="photo"><img class="scene" src="${esc(im.src)}" data-local="${esc(im.local)}" alt="Picture for this task" referrerpolicy="no-referrer" onerror="if(this.dataset.local&&this.src!==this.dataset.local){this.src=this.dataset.local}">`
         + `<figcaption class="small muted">Photo${credit ? ': ' + esc(credit) : ''}${im.link ? ` · <a href="${esc(im.link)}" target="_blank" rel="noopener noreferrer">source</a>` : ''}</figcaption></figure>`;
     }
     if (im) return `<img class="scene" src="${im}" alt="Picture for this task">`;
-    return task.desc ? `<div class="note small"><b>Picture:</b> no photo could be loaded, so here is what it shows. ${esc(task.desc)}</div>` : '';
+    return task.desc ? `<div class="note small"><b>Picture:</b> no picture could be made, so here is what it shows. ${esc(task.desc)}</div>` : '';
   };
   const details = o => `<ul class="small">${(o.details||[]).map(d => `<li>${esc(d)}</li>`).join('')}</ul>`;
   const optCard = (o, k) => `<button class="optcard" data-choose="${k}" aria-pressed="${choice===k}" ${phase!=='choose'?'disabled':''}><b>${esc(o.name || 'Option '+k)}</b>${details(o)}</button>`;
